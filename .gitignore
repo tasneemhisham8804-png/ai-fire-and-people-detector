@@ -1,0 +1,24 @@
+# Model weights — too large / binary for plain git history.
+# Share these via Drive/a release asset, or set up Git LFS if you need them versioned.
+*.pt
+*.pth
+*.keras
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Temp frames written during video analysis (should already live in a
+# TemporaryDirectory that's cleaned up, but ignore stragglers just in case)
+frame_*.jpg
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
