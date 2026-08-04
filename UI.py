@@ -101,13 +101,29 @@ html, body, [class*="css"], .stApp{
    entirely until you're mid-scroll, which on a page this tall can read as
    "the page doesn't scroll" even though it does — worth forcing it visible
    for anything shown on a projector/demo machine where that ambiguity
-   isn't great. `scroll` (not `auto`) reserves the track permanently so it
-   doesn't pop in/out and shift layout width as content changes.
-   The -webkit- rules theme Chrome/Edge/Safari's scrollbar to match the
-   coral/amber palette instead of the default OS grey; Firefox does the
-   same via `scrollbar-color` below since it doesn't support the
-   ::-webkit-scrollbar pseudo-elements. */
-html, body {
+   isn't great.
+
+   Streamlit doesn't actually scroll `html`/`body` — the real scrolling
+   element is an inner wrapper div Streamlit renders around the whole app
+   (data-testid stAppViewContainer / stMain in recent versions, a plain
+   section.main in older ones). Forcing overflow-y:scroll on html/body
+   alone reserves a track there, but that track has nothing to scroll —
+   the actual overflowing content is scrolling inside the inner container,
+   so you'd see a gutter that does nothing when you try to use it. Listing
+   Streamlit's known container selectors alongside html/body targets
+   whichever one is the real scrolling element across versions, while
+   leaving html/body in as a harmless no-op fallback.
+
+   `scroll` (not `auto`) reserves the track permanently so it doesn't pop
+   in/out and shift layout width as content changes. The -webkit- rules
+   theme Chrome/Edge/Safari's scrollbar to match the coral/amber palette
+   instead of the default OS grey; Firefox does the same via
+   `scrollbar-color` below since it doesn't support the ::-webkit-scrollbar
+   pseudo-elements. */
+html, body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+section.main {
   overflow-y: scroll !important;
   scrollbar-width: thin; /* Firefox */
   scrollbar-color: var(--coral) var(--bg-2); /* Firefox: thumb track */
