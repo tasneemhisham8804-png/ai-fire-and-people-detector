@@ -237,6 +237,15 @@ html, body, [class*="css"], .stApp{
 # used to show regardless of whether the backend was actually up). The
 # backend's CORS config already allows any origin, so this fetch from the
 # browser works against a locally-running FastAPI server.
+#
+# Three states, not two: people_model_loaded alone can't tell a genuine
+# load failure apart from a silent fallback to generic yolov8n.pt weights
+# (see PEOPLE_DETECTOR.load_people_model / MAIN.py's /health docstring) —
+# both report people_model_loaded: true. The extra
+# people_model_using_fallback flag is what lets this distinguish "healthy"
+# from "technically running, but not with the trained model," which
+# matters a lot for anyone judging this project's actual detection
+# accuracy rather than just whether the server responds.
 _health_script = """
 <script>
 fetch("__HEALTH_URL__")
@@ -245,12 +254,15 @@ fetch("__HEALTH_URL__")
     const dot = window.parent.document.getElementById("status-dot");
     const txt = window.parent.document.getElementById("status-text");
     if (!dot || !txt) return;
-    if (d.fire_model_loaded && d.people_model_loaded) {
-      txt.textContent = "All models online";
-      dot.classList.add("dot-ok");
-    } else {
+    if (!d.fire_model_loaded || !d.people_model_loaded) {
       txt.textContent = "Backend up, a model failed to load";
       dot.classList.add("dot-warn");
+    } else if (d.people_model_using_fallback) {
+      txt.textContent = "Online — using fallback person detector";
+      dot.classList.add("dot-warn");
+    } else {
+      txt.textContent = "All models online";
+      dot.classList.add("dot-ok");
     }
   })
   .catch(() => {
@@ -323,6 +335,15 @@ def render_dashboard(r: dict, filename: str):
     """Renders the verdict card, metrics, chart, and frame chips for one result."""
     ai_available = r.get("ai_check_available", True)
     ai_prob = r.get("ai_generated_probability")
+    # Present once the backend flags a clip as AI-generated: fire/people
+    # detection isn't just "not found" in that case, it was never run at
+    # all (see MAIN.py's run_analysis — running expensive fire/people
+    # models against footage already known to be synthetic would only
+    # produce findings that need to be discarded). These flags drive the
+    # metrics and panels below so the UI doesn't imply "no fire" when the
+    # honest answer is "not checked."
+    fire_skipped = r.get("fire_check_skipped", False)
+    people_skipped = r.get("people_check_skipped", False)
 
     # Verdict styling is driven off the structured fields the backend
     # returns, not by substring-matching r["verdict"] — a check like
@@ -339,6 +360,8 @@ def render_dashboard(r: dict, filename: str):
     ai_flag_html = ""
     if not ai_available:
         ai_flag_html = '<div class="verd-subflag">⚠ AI-generated check unavailable — model not loaded</div>'
+    elif fire_skipped or people_skipped:
+        ai_flag_html = '<div class="verd-subflag">🚫 Fire/people detection skipped — footage flagged as AI-generated</div>'
 
     # Kept as one line on purpose: st.markdown(unsafe_allow_html=True) parses
     # raw HTML until it hits a blank line, then falls back to normal
@@ -357,64 +380,87 @@ def render_dashboard(r: dict, filename: str):
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.metric("🔥 Fire", "Yes" if r["fire_detected"] else "No", f"{r['max_fire_confidence']*100:.1f}% conf")
+        if fire_skipped:
+            st.metric("🔥 Fire", "Skipped", "AI-generated")
+        else:
+            st.metric("🔥 Fire", "Yes" if r["fire_detected"] else "No", f"{r['max_fire_confidence']*100:.1f}% conf")
     with c2:
-        st.metric("🧍 People", "Yes" if r["people_detected"] else "No", f"Peak {r['peak_people_count']}")
+        if people_skipped:
+            st.metric("🧍 People", "Skipped", "AI-generated")
+        else:
+            st.metric("🧍 People", "Yes" if r["people_detected"] else "No", f"Peak {r['peak_people_count']}")
     with c3:
-        prox = r.get("closest_person_to_fire_px")
-        st.metric("📏 Proximity", f"{prox:.0f}px" if prox is not None else "—",
-                   "Near fire" if r["people_near_fire"] else "n/a")
+        if people_skipped:
+            st.metric("📏 Proximity", "—", "Skipped")
+        else:
+            prox = r.get("closest_person_to_fire_px")
+            st.metric("📏 Proximity", f"{prox:.0f}px" if prox is not None else "—",
+                       "Near fire" if r["people_near_fire"] else "n/a")
     with c4:
         ai_display = f"{ai_prob*100:.1f}%" if ai_prob is not None else "N/A"
         st.metric("🎭 AI score", ai_display, None if ai_available else "unavailable")
     with c5:
         st.metric("🎞 Frames", r["total_frames_analyzed"], f"{r.get('processing_time_seconds', '—')}s")
 
-    # ── fire confidence timeline (SVG sparkline) ──
-    timeline = r.get("fire_confidence_timeline", [])
-    if timeline:
-        w, h, pad = 640, 120, 10
-        n = len(timeline)
-        step = (w - 2 * pad) / max(1, n - 1)
-        pts = " ".join(
-            f"{pad + i*step:.1f},{h - pad - v*(h - 2*pad):.1f}"
-            for i, v in enumerate(timeline)
-        )
-        area_pts = f"{pad},{h-pad} " + pts + f" {w-pad},{h-pad}"
-        thresh_y = h - pad - FIRE_CONFIDENCE_THRESHOLD * (h - 2 * pad)
-        flagged_dots = "".join(
-            f'<circle cx="{pad + i*step:.1f}" cy="{h - pad - timeline[i]*(h - 2*pad):.1f}" r="3.5" fill="var(--amber)" stroke="#fff" stroke-width="1" />'
-            for i in r["fire_flagged_frames"]
-        )
-        st.markdown(f"""
+    if fire_skipped:
+        # Replaces the sparkline chart + frame chips below — there's no
+        # per-frame fire data to show when the fire model never ran, and an
+        # empty chart/chip panel (or worse, no panel at all with no
+        # explanation) would read as a bug rather than a deliberate skip.
+        st.markdown("""
         <div class="panel">
-          <div class="p-title">Fire confidence — per frame</div>
-          <svg viewBox="0 0 {w} {h}" style="width:100%;height:auto;display:block;">
-            <line x1="{pad}" y1="{thresh_y:.1f}" x2="{w-pad}" y2="{thresh_y:.1f}"
-                  stroke="#E0502B55" stroke-width="1" stroke-dasharray="4,4" />
-            <polygon points="{area_pts}" fill="url(#fireGrad)" opacity="0.30" />
-            <polyline points="{pts}" fill="none" stroke="#FF6B45" stroke-width="2.5" stroke-linejoin="round" />{flagged_dots}
-            <defs>
-              <linearGradient id="fireGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#FF6B45"/>
-                <stop offset="100%" stop-color="#FF6B45" stop-opacity="0"/>
-              </linearGradient>
-            </defs>
-          </svg>
+          <div class="p-title">Fire / people detection</div>
+          <div style="font-size:13px;color:var(--ink-soft);">
+            Skipped — this clip was flagged as AI-generated, so fire and
+            people checks weren't run against it.
+          </div>
         </div>""", unsafe_allow_html=True)
+    else:
+        # ── fire confidence timeline (SVG sparkline) ──
+        timeline = r.get("fire_confidence_timeline", [])
+        if timeline:
+            w, h, pad = 640, 120, 10
+            n = len(timeline)
+            step = (w - 2 * pad) / max(1, n - 1)
+            pts = " ".join(
+                f"{pad + i*step:.1f},{h - pad - v*(h - 2*pad):.1f}"
+                for i, v in enumerate(timeline)
+            )
+            area_pts = f"{pad},{h-pad} " + pts + f" {w-pad},{h-pad}"
+            thresh_y = h - pad - FIRE_CONFIDENCE_THRESHOLD * (h - 2 * pad)
+            flagged_dots = "".join(
+                f'<circle cx="{pad + i*step:.1f}" cy="{h - pad - timeline[i]*(h - 2*pad):.1f}" r="3.5" fill="var(--amber)" stroke="#fff" stroke-width="1" />'
+                for i in r["fire_flagged_frames"]
+            )
+            st.markdown(f"""
+            <div class="panel">
+              <div class="p-title">Fire confidence — per frame</div>
+              <svg viewBox="0 0 {w} {h}" style="width:100%;height:auto;display:block;">
+                <line x1="{pad}" y1="{thresh_y:.1f}" x2="{w-pad}" y2="{thresh_y:.1f}"
+                      stroke="#E0502B55" stroke-width="1" stroke-dasharray="4,4" />
+                <polygon points="{area_pts}" fill="url(#fireGrad)" opacity="0.30" />
+                <polyline points="{pts}" fill="none" stroke="#FF6B45" stroke-width="2.5" stroke-linejoin="round" />{flagged_dots}
+                <defs>
+                  <linearGradient id="fireGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#FF6B45"/>
+                    <stop offset="100%" stop-color="#FF6B45" stop-opacity="0"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+            </div>""", unsafe_allow_html=True)
 
-    # Frame chips now actually populate — the backend used to hardcode
-    # "fire_flagged_frames" to an empty list in its response even though it
-    # had already computed the real list internally, so this section (and
-    # the flagged dots on the chart above) silently never showed anything.
-    # Fixed in MAIN.py alongside this.
-    if r["fire_flagged_frames"]:
-        chips = "".join(f'<span class="chip">#{str(i).zfill(2)}</span>' for i in r["fire_flagged_frames"])
-        st.markdown(f"""
-        <div class="panel">
-          <div class="p-title">Fire flagged frames — {len(r["fire_flagged_frames"])} / {r["total_frames_analyzed"]}</div>
-          <div class="chips">{chips}</div>
-        </div>""", unsafe_allow_html=True)
+        # Frame chips now actually populate — the backend used to hardcode
+        # "fire_flagged_frames" to an empty list in its response even though it
+        # had already computed the real list internally, so this section (and
+        # the flagged dots on the chart above) silently never showed anything.
+        # Fixed in MAIN.py alongside this.
+        if r["fire_flagged_frames"]:
+            chips = "".join(f'<span class="chip">#{str(i).zfill(2)}</span>' for i in r["fire_flagged_frames"])
+            st.markdown(f"""
+            <div class="panel">
+              <div class="p-title">Fire flagged frames — {len(r["fire_flagged_frames"])} / {r["total_frames_analyzed"]}</div>
+              <div class="chips">{chips}</div>
+            </div>""", unsafe_allow_html=True)
 
     with st.expander("See the full raw response"):
         st.json(r)

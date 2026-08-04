@@ -19,6 +19,12 @@ logger = logging.getLogger("people_detector")
 
 _model = None
 _weights_path = config.PEOPLE_MODEL_PATH
+# True once load_people_model() has fallen back to the generic yolov8n.pt
+# because the custom weights failed to load. Tracked separately from
+# `_model is None` (which is never true after a load attempt, by design —
+# see load_people_model) so callers like MAIN.py's /health can tell "a
+# model is loaded" apart from "the *intended* model is loaded".
+_using_fallback = False
 
 # Both the custom-trained weights and the yolov8n.pt fallback report a class
 # literally named "person" (index 0 in standard COCO; the custom model was
@@ -46,16 +52,36 @@ def load_people_model(weights_path: str = config.PEOPLE_MODEL_PATH):
     this once, for one weights file, at process startup — the model is
     meant to be loaded a single time and reused across all requests, not
     reloaded per-request.
+
+    Whether the fallback was actually used is recorded in the module-level
+    `_using_fallback` flag (read via is_using_fallback_weights()) rather
+    than only being logged — a silently-degraded person detector matters
+    enough here (this is a safety-adjacent tool) that it should be
+    queryable at runtime, not just discoverable by reading server logs.
     """
-    global _model, _weights_path
+    global _model, _weights_path, _using_fallback
     _weights_path = weights_path
     try:
         _model = YOLO(weights_path)
+        _using_fallback = False
         logger.info("People model loaded successfully from %s", weights_path)
     except Exception as e:
         logger.error("People model '%s' failed to load, falling back to yolov8n.pt: %s", weights_path, e)
         _model = YOLO("yolov8n.pt")
+        _using_fallback = True
     return _model
+
+
+def is_using_fallback_weights() -> bool:
+    """
+    True if the active model is the generic yolov8n.pt fallback rather than
+    the project's custom-trained weights — i.e. the custom weights failed
+    to load. Exposed so callers (MAIN.py's /health) can surface this to
+    anyone judging the pipeline's real-world accuracy: "a person model is
+    loaded" and "the *trained* person model is loaded" are different claims,
+    and only this flag distinguishes them.
+    """
+    return _using_fallback
 
 
 def _box_gap(box_a: list[float], box_b: list[float]) -> float:

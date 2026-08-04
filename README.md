@@ -68,16 +68,25 @@ TRAINING3/
 
 ## API
 
-`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB.
+`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB (see `MAX_VIDEO_DURATION_SECONDS` in `config.py` for the separate duration cap).
 
-Returns:
+The AI-generated check runs *first*. If a clip is flagged as AI-generated,
+fire and people detection are skipped entirely rather than run against
+footage already known to be synthetic — `fire_check_skipped` /
+`people_check_skipped` are `true` in that case, and `fire_detected` /
+`people_detected` are `false` because they were never checked, not because
+nothing was found.
+
+Returns (a real, non-AI-generated clip with fire and people detected):
 ```json
 {
   "fire_detected": true,
+  "fire_check_skipped": false,
   "max_fire_confidence": 0.94,
   "fire_flagged_frames": [3, 4, 5],
   "fire_confidence_timeline": [0.1, 0.2, 0.94, ...],
   "people_detected": true,
+  "people_check_skipped": false,
   "people_near_fire": true,
   "peak_people_count": 2,
   "closest_person_to_fire_px": 45.2,
@@ -89,10 +98,32 @@ Returns:
 }
 ```
 
+Returns (a clip flagged as AI-generated — fire/people checks skipped):
+```json
+{
+  "fire_detected": false,
+  "fire_check_skipped": true,
+  "max_fire_confidence": 0.0,
+  "fire_flagged_frames": [],
+  "fire_confidence_timeline": [],
+  "people_detected": false,
+  "people_check_skipped": true,
+  "people_near_fire": false,
+  "peak_people_count": 0,
+  "closest_person_to_fire_px": null,
+  "ai_generated_probability": 0.91,
+  "ai_check_available": true,
+  "total_frames_analyzed": 42,
+  "processing_time_seconds": 1.94,
+  "verdict": "AI-generated footage — fire/people detection skipped"
+}
+```
+
 If the AI-generated model fails to load, `ai_check_available` is `false` and
-`ai_generated_probability` is `null` — the verdict will say
-"AI-generated check unavailable" instead of silently assuming the footage
-is real.
+`ai_generated_probability` is `null` — fire/people detection runs as normal
+in that case (there's no AI-generated signal to skip on), and the verdict
+will say "AI-generated check unavailable" instead of silently assuming the
+footage is real.
 
 `GET /health` — reports whether each model loaded successfully.
 

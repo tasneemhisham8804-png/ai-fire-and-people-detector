@@ -1,15 +1,17 @@
 """
 Tests for _box_gap — the pure geometry function behind "is a person near
-fire" (see PEOPLE_DETECTOR.py). Doesn't touch the YOLO model at all, so
-these run fast with no GPU or model weights needed — conftest.py's stubs
-just need to let PEOPLE_DETECTOR.py import cleanly.
+fire" (see PEOPLE_DETECTOR.py) — plus load_people_model's fallback-tracking
+behavior. Doesn't touch a real YOLO model at all, so these run fast with no
+GPU or model weights needed — conftest.py's stubs just need to let
+PEOPLE_DETECTOR.py import cleanly.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from PEOPLE_DETECTOR import _box_gap
+import PEOPLE_DETECTOR
+from PEOPLE_DETECTOR import _box_gap, is_using_fallback_weights, load_people_model
 
 
 def test_overlapping_boxes_have_zero_gap():
@@ -48,3 +50,29 @@ def test_proximity_threshold_boundary():
     box_b = [100 + PROXIMITY_THRESHOLD_PX, 0, 300, 100]
     gap = _box_gap(box_a, box_b)
     assert gap == PROXIMITY_THRESHOLD_PX
+
+
+def test_successful_custom_load_is_not_flagged_as_fallback(monkeypatch):
+    """When the custom weights load without error, is_using_fallback_weights() must report False."""
+    monkeypatch.setattr(PEOPLE_DETECTOR, "YOLO", lambda path: object())
+    load_people_model("best.pt")
+    assert is_using_fallback_weights() is False
+
+
+def test_failed_custom_load_falls_back_and_is_flagged(monkeypatch):
+    """
+    When the custom weights fail to load, load_people_model() must still
+    return a usable model (the yolov8n.pt fallback) but is_using_fallback_weights()
+    must report True — this is what lets /health tell "a person model is
+    loaded" apart from "the *trained* person model is loaded" instead of
+    reporting a silently-degraded pipeline as fully healthy.
+    """
+    def _flaky_yolo(path):
+        if path == "best.pt":
+            raise RuntimeError("corrupt weights file")
+        return object()  # yolov8n.pt fallback path "succeeds"
+
+    monkeypatch.setattr(PEOPLE_DETECTOR, "YOLO", _flaky_yolo)
+    model = load_people_model("best.pt")
+    assert model is not None
+    assert is_using_fallback_weights() is True

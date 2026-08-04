@@ -77,6 +77,15 @@ AI_SAMPLE_SIZE = 10
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
 MAX_UPLOAD_MB = 100
 
+# Upper bound on a video's *duration*, independent of MAX_UPLOAD_MB. A long,
+# low-bitrate clip can be small in MB while still decoding into thousands of
+# sampled frames at TARGET_FPS, which would blow up analysis time (and, via
+# the people-detector loop over every fire-flagged frame, GPU cost) far
+# beyond what the file-size limit alone would suggest. Checked against the
+# video's own metadata (frame_count / fps) right after it's opened, before
+# any frames are extracted.
+MAX_VIDEO_DURATION_SECONDS = 300
+
 # Frames-per-second the video is *downsampled* to before running any model.
 # Running inference at the source video's native FPS (often 24-60) would be
 # far more compute than the analysis needs — fire/people/AI-ness don't
@@ -89,8 +98,20 @@ TARGET_FPS = 3
 # .mp4 would otherwise sail through). Checking the first few bytes of the
 # actual file content against known container-format signatures catches
 # that class of mismatch before the file is ever handed to OpenCV.
-VIDEO_MAGIC_BYTES = {
-    b"RIFF": ".avi",           # RIFF....AVI
-    b"\x1a\x45\xdf\xa3": ".mkv",
-    # MP4/MOV: 'ftyp' box appears at byte offset 4, not at the start
-}
+#
+# Each entry is (byte_offset, magic_bytes, valid_extensions) — the file is
+# recognized as a known video container if `magic_bytes` is found at
+# `byte_offset`, and considered a *match for the claimed extension* only if
+# that claimed extension is in `valid_extensions`. The ISO base media
+# 'ftyp' box (offset 4) is shared by both .mp4 and .mov, so both extensions
+# are accepted for that one signature; RIFF/AVI and Matroska/EBML each map
+# to exactly one extension. Read directly by MAIN.py's
+# _sniff_video_content(), which checks the claimed extension against this
+# table rather than just confirming "this is some kind of video" — a .mp4
+# upload that's actually a renamed .avi is a content/extension mismatch
+# worth rejecting, not a false alarm.
+VIDEO_MAGIC_BYTES = [
+    (0, b"RIFF", {".avi"}),           # full check also confirms bytes 8-11 == b"AVI "
+    (0, b"\x1a\x45\xdf\xa3", {".mkv"}),
+    (4, b"ftyp", {".mp4", ".mov"}),
+]
