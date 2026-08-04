@@ -96,6 +96,31 @@ html, body, [class*="css"], .stApp{
 #MainMenu, footer, header {visibility:hidden;}
 .block-container {padding-top: 1rem !important; max-width: 720px !important;}
 
+/* ── scrollbar ──
+   Some OS/browser combos (macOS in particular) hide the scrollbar track
+   entirely until you're mid-scroll, which on a page this tall can read as
+   "the page doesn't scroll" even though it does — worth forcing it visible
+   for anything shown on a projector/demo machine where that ambiguity
+   isn't great. `scroll` (not `auto`) reserves the track permanently so it
+   doesn't pop in/out and shift layout width as content changes.
+   The -webkit- rules theme Chrome/Edge/Safari's scrollbar to match the
+   coral/amber palette instead of the default OS grey; Firefox does the
+   same via `scrollbar-color` below since it doesn't support the
+   ::-webkit-scrollbar pseudo-elements. */
+html, body {
+  overflow-y: scroll !important;
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: var(--coral) var(--bg-2); /* Firefox: thumb track */
+}
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-2); }
+::-webkit-scrollbar-thumb {
+  background: var(--coral);
+  border-radius: 10px;
+  border: 2px solid var(--bg-2);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--coral-deep); }
+
 /* ── ambient background blobs (pure CSS, no per-frame JS) ──
    The old version ran a cellular-automaton fire simulation plus 220 ember
    particles on a canvas, redrawn every animation frame, forever, even when
