@@ -27,6 +27,12 @@ All of this is combined into a single JSON verdict — see `MAIN.py`'s module
 docstring for the full request flow, and each detector module's docstring
 for how its piece works.
 
+Model inference (the Keras fire classifier, the YOLO people detector, and
+the HuggingFace AI-generated pipeline) is each serialized behind its own
+lock, since concurrent `/analyze` requests run in separate threadpool
+workers and none of these underlying model objects are documented as safe
+for concurrent calls from multiple threads.
+
 ## Setup
 
 ```bash
@@ -35,15 +41,35 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Place these two model files in the project root (not committed to git — see `.gitignore`):
-- `fire_detector.keras`
-- `best.pt`
+Place these two model paths in the project root (not committed to git —
+matched by `*.keras` / `*.pt` in `.gitignore`):
+- `Fire_DETECTOR.keras` — matches `config.FIRE_MODEL_PATH` exactly, including
+  case. This is a Keras 3 model export: if it's a **folder**, that folder
+  must contain `config.json` and `model.weights.h5` directly inside it
+  (`FIRE_DETECTOR.load_fire_model` looks for those two files specifically,
+  and falls back to treating it as a single legacy `.keras`/`.h5` file only
+  if the path isn't a directory). If your export is an older TensorFlow
+  SavedModel directory (`saved_model.pb` + a `variables/` folder) instead,
+  it will **not** load with this code as-is — re-export with
+  `model.save("Fire_DETECTOR.keras")` under Keras 3, or adjust
+  `load_fire_model` to also handle the SavedModel layout.
+- `best.pt` — the custom-trained YOLO weights. If this fails to load,
+  `PEOPLE_DETECTOR.py` automatically falls back to the generic pretrained
+  `yolov8n.pt` rather than failing startup — check `GET /health`'s
+  `people_model_using_fallback` field to see whether that happened.
+
+**Case matters on case-sensitive filesystems** (Linux, most cloud hosts,
+WSL) even though it's invisible on Windows: the file/folder name must be
+`Fire_DETECTOR.keras`, matching `config.FIRE_MODEL_PATH` exactly — not
+`fire_detector.keras` or any other casing.
 
 The AI-generated check uses `umm-maybe/AI-image-detector` from the
 HuggingFace hub instead of a local weights file, so it needs internet
 access the first time it runs (it caches locally after that). If it can't
 reach the hub, `/analyze` still works — the response just comes back with
-`ai_check_available: false` instead of a real AI-generated score.
+`ai_check_available: false` instead of a real AI-generated score. A failed
+load is retried automatically after `config.AI_DETECTOR_RETRY_COOLDOWN_SECONDS`
+rather than being disabled for the rest of the process's lifetime.
 
 ## Running
 
@@ -57,27 +83,50 @@ Frontend:
 py -3.12 -m streamlit run UI.py --server.fileWatcherType none
 ```
 
+Start the backend first — the Streamlit UI's "system online" badge does a
+live `GET /health` check against it, and `/analyze` calls will fail with a
+"can't reach the backend" message in the UI if the backend isn't already
+running.
+
 ## Project structure
 
+All application code, tests, and evaluation scripts currently sit flat in
+the project root (there is no `tests/` subfolder):
+
 ```
-TRAINING3/
-├── config.py              # all thresholds/paths in one place
-├── MAIN.py                # FastAPI app, /analyze and /health endpoints
-├── FIRE_DETECTOR.py        # MobileNetV2 fire classifier + HSV localization
-├── PEOPLE_DETECTOR.py      # YOLO people detector + fire-proximity check
-├── AI_DETECTOR.py          # HuggingFace ViT real-vs-AI-generated classifier
-├── UI.py                   # Streamlit frontend
+ai-fire-and-people-detector/
+├── config.py                          # all thresholds/paths in one place
+├── MAIN.py                            # FastAPI app, /analyze and /health endpoints
+├── FIRE_DETECTOR.py                   # MobileNetV2 fire classifier + HSV localization
+├── PEOPLE_DETECTOR.py                 # YOLO people detector + fire-proximity check
+├── AI_DETECTOR.py                     # HuggingFace ViT real-vs-AI-generated classifier
+├── UI.py                              # Streamlit frontend
+├── conftest.py                        # stubs heavy ML deps so pure-logic tests run fast
+├── test_fire_detector.py
+├── test_people_detector.py
+├── test_ai_detector.py
+├── test_main.py
+├── evaluate.py                        # real-accuracy evaluation harness (needs labeled clips)
+├── evaluate_fire_localizer_synthetic.py
+├── LIMITATIONS.md
 ├── requirements.txt
-├── tests/
-│   ├── conftest.py         # stubs heavy ML deps so pure-logic tests run fast
-│   ├── test_fire_detector.py
-│   └── test_people_detector.py
-└── fire_detector.keras / best.pt   # not committed
+├── .gitignore
+└── Fire_DETECTOR.keras / best.pt      # not committed — see Setup above
 ```
+
+> **Note:** every `test_*.py` file inserts `Path(__file__).parent.parent`
+> onto `sys.path`, which assumes the test file lives one level *below* the
+> project root (e.g. inside a `tests/` folder). With the current flat
+> layout, that resolves to the project root's *parent* directory instead —
+> if `import config` or `import PEOPLE_DETECTOR` fails when you run
+> `pytest`, this path mismatch is why. Either move the `test_*.py` files
+> into an actual `tests/` subfolder to match what they assume, or change
+> each file's `sys.path.insert` line to use `.parent` instead of
+> `.parent.parent`.
 
 ## API
 
-`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB (see `MAX_VIDEO_DURATION_SECONDS` in `config.py` for the separate duration cap).
+`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB (see `MAX_VIDEO_DURATION_SECONDS` in `config.py` for the separate duration cap, and `MAX_EXTRACTED_FRAMES` for a hard backstop independent of that).
 
 The AI-generated check runs *first*. If a clip is flagged as AI-generated,
 fire and people detection are skipped entirely rather than run against
@@ -134,7 +183,12 @@ in that case (there's no AI-generated signal to skip on), and the verdict
 will say "AI-generated check unavailable" instead of silently assuming the
 footage is real.
 
-`GET /health` — reports whether each model loaded successfully.
+`GET /health` — reports whether each model loaded successfully, including
+`people_model_using_fallback` (true if `best.pt` failed to load and the
+generic `yolov8n.pt` is being used instead).
+
+`GET /` — basic liveness check; confirms the process is up and reports
+`fire_model_loaded`.
 
 ## Running tests
 
@@ -145,11 +199,15 @@ py -3.12 -m pytest -v
 Tests stub out `tensorflow`/`ultralytics`/`torch`/`transformers` via
 `conftest.py` so they run in under a second without needing the actual
 model weights. Coverage spans two layers:
-- Pure-logic / classical-CV helpers (`_box_gap`, `_localize_fire_regions`) —
-  `test_fire_detector.py`, `test_people_detector.py`
+- Pure-logic / classical-CV helpers (`_box_gap`, `_localize_fire_regions`),
+  plus model-loading fallback and retry behavior — `test_fire_detector.py`,
+  `test_people_detector.py`, `test_ai_detector.py`
 - The HTTP orchestration layer (`/analyze`, `/health` — validation, error
-  handling, verdict-assembly logic) — `test_main.py`, with all model
-  inference calls monkeypatched out
+  handling, rate limiting, API-key auth, verdict-assembly logic) —
+  `test_main.py`, with all model inference calls monkeypatched out
+
+See the note under **Project structure** above if these imports fail to
+resolve when you run pytest.
 
 Neither layer tells you how *accurate* the trained models are on real
 footage — see Evaluation below for that.
@@ -200,3 +258,29 @@ The rate limiter is in-memory and per-process — it resets on restart and
 doesn't share state across multiple server replicas. Fine for the
 single-instance deployment this project targets; would need a shared store
 (e.g. Redis) behind a load balancer with more than one backend process.
+
+## Troubleshooting
+
+- **`/analyze` always returns 503, or the UI never shows results below the
+  uploader:** check `GET /health` first — this tells you which model
+  failed to load. A `fire_model_loaded: false` almost always means
+  `Fire_DETECTOR.keras` either isn't present at the path `config.py`
+  expects, or its internal format doesn't match what `load_fire_model`
+  expects (see **Setup** above). The Streamlit UI has no results to show
+  and nothing to scroll to until a request actually succeeds — a missing
+  scrollbar on a short page is usually a symptom of this, not a separate
+  frontend bug.
+- **Backend process won't start at all / crashes immediately:** both
+  models load at import time in `MAIN.py`, before the server can accept
+  any requests. `load_fire_model` catches its own errors and returns
+  `None`, but check your terminal output for the actual exception either
+  way — a broken `tensorflow`/`ultralytics`/`torch` install (e.g. CPU-only
+  wheels installed instead of the CUDA build noted in `requirements.txt`)
+  is a common cause and won't necessarily show up as a clean error message.
+- **UI shows "Backend unreachable":** start the backend before the
+  frontend, and confirm it's actually listening on
+  `http://localhost:8000` (or set `DETECTOR_API_URL` if you've changed the
+  port/host).
+- **`pytest` fails to import `config` / `PEOPLE_DETECTOR` / etc.:** see the
+  note under **Project structure** above about the `tests/`-folder
+  assumption in each test file's `sys.path.insert` line.
