@@ -7,16 +7,25 @@ FastAPI backend + Streamlit frontend that analyzes a video for:
 
 ## How it works
 
-A video upload is decoded and downsampled to `TARGET_FPS` frames. Each
-frame runs through the fire classifier, producing a per-frame confidence
-score and (on flagged frames) fire bounding boxes via classical HSV color
-thresholding. Frames flagged as containing fire are then passed to the
-people detector, which finds person bounding boxes and checks their
-distance to the fire boxes. Separately, a small evenly-spaced sample of
-frames is run through the AI-generated-image classifier and averaged into
-one probability. All of this is combined into a single JSON verdict — see
-`MAIN.py`'s module docstring for the full request flow, and each detector
-module's docstring for how its piece works.
+A small, evenly-spaced sample of frames (`AI_SAMPLE_SIZE`, decoded via
+direct frame seeking, not a full extraction) is run through the
+AI-generated-image classifier first and averaged into one clip-level
+probability. **If that probability clears `AI_GENERATED_THRESHOLD`, fire
+and people detection are skipped entirely** — the video is decoded and
+downsampled to `TARGET_FPS` frames, and the fire/people pipeline below
+runs, only when the clip *isn't* flagged as AI-generated (or the
+AI-generated check itself is unavailable). This ordering means a clip
+confidently identified as synthetic never pays for the two more expensive
+models at all, rather than running them and discarding the result.
+
+When fire/people detection does run: each extracted frame runs through the
+fire classifier, producing a per-frame confidence score and (on flagged
+frames) fire bounding boxes via classical HSV color thresholding. Frames
+flagged as containing fire are then passed to the people detector, which
+finds person bounding boxes and checks their distance to the fire boxes.
+All of this is combined into a single JSON verdict — see `MAIN.py`'s module
+docstring for the full request flow, and each detector module's docstring
+for how its piece works.
 
 ## Setup
 
@@ -175,3 +184,19 @@ tested against.
 one `model.predict()` call. 16 is a reasonable starting point for a GTX
 1650 — raise it if you have headroom, lower it if you hit CUDA OOM errors.
 See `config.py` for explanations of every other tunable value.
+
+## Optional API protection
+
+Both are **off by default** — no header or setup needed for local/demo use.
+Set the corresponding environment variable before starting the server to
+turn either on:
+
+| Env var | Effect |
+|---|---|
+| `FIRE_DETECTOR_API_KEY` | If set, every `/analyze` request must include a matching `X-API-Key` header, or it's rejected with `401`. |
+| `FIRE_DETECTOR_RATE_LIMIT_PER_MINUTE` | If set to a number > 0, caps `/analyze` requests per client IP to that many per rolling 60s window; excess requests get `429`. |
+
+The rate limiter is in-memory and per-process — it resets on restart and
+doesn't share state across multiple server replicas. Fine for the
+single-instance deployment this project targets; would need a shared store
+(e.g. Redis) behind a load balancer with more than one backend process.

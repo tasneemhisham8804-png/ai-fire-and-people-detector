@@ -1,0 +1,1753 @@
+diff --git a/AI_DETECTOR.py b/AI_DETECTOR.py
+index b963e05..49b2f43 100644
+--- a/AI_DETECTOR.py
++++ b/AI_DETECTOR.py
+@@ -11,40 +11,58 @@ a broader mix of generated-image sources instead.
+ 
+ """
+ import logging
++import threading
++import time
+ 
+ from transformers import pipeline
+ import config
+ logger = logging.getLogger("ai_detector")
+ 
+ _detector = None
+-_load_attempted = False
++_last_load_attempt = None  # monotonic timestamp of the most recent load attempt, success or failure
++# Serializes calls into the HF pipeline itself (see predict_ai_generated) —
++# not the load, which is already effectively single-shot via the cooldown
++# check below.
++_inference_lock = threading.Lock()
+ 
+ def _get_model():
+     """
+     Lazily loads the HuggingFace pipeline on first use and caches it in a
+     module-level global, rather than loading it at import time or on every
+     call. Loading downloads/initializes the model from the HuggingFace hub,
+-    which is slow and needs network access on first run ,doing this lazily
+-    doesn't pay that cost, and
+-    doing it once means later frames/requests reuse the already-loaded model
++    which is slow and needs network access on first run; doing this lazily
++    avoids paying that cost until the model is actually needed, and doing
++    it once means later frames/requests reuse the already-loaded model
+     instead of reloading it each time.
+ 
+-    _load_attempted (separate from _detector being None) ensures a failed
+-    load is only attempted once per process, not retried on every single
+-    frame/request if the HF hub is unreachable, retrying the slow download
+-    on every request would make every subsequent frame's prediction slow
+-    for no benefit, since the failure reason isn't going to change mid-run.
++    A failed load is retried at most once per config.AI_DETECTOR_RETRY_COOLDOWN_SECONDS
++    (tracked via _last_load_attempt), rather than either retrying on every
++    single call (which would make every frame's prediction slow whenever the
++    HF hub is unreachable) or never retrying again for the rest of the
++    process's lifetime (the previous behavior — a one-shot `_load_attempted`
++    flag meant a transient failure at startup disabled the AI-generated
++    check permanently, with no recovery short of restarting the server).
++    This matters more now than it used to: the AI-generated check gates
++    whether fire/people detection even runs (see MAIN.py's run_analysis), so
++    a stuck-off check silently reverts every subsequent video to the more
++    expensive always-run-everything path.
+     """
+-    global _detector, _load_attempted
+-    if _load_attempted:
++    global _detector, _last_load_attempt
++    if _detector is not None:
+         return _detector
+-    _load_attempted = True
++
++    now = time.monotonic()
++    if _last_load_attempt is not None and (now - _last_load_attempt) < config.AI_DETECTOR_RETRY_COOLDOWN_SECONDS:
++        return None
++
++    _last_load_attempt = now
+     try:
+         _detector = pipeline("image-classification",
+                             model="umm-maybe/AI-image-detector")
+         logger.info("HuggingFace AI detector loaded")
+     except Exception as e:
+-        logger.error("AI detector failed to load: %s", e)
++        logger.error("AI detector failed to load, will retry in %ds: %s",
++                      config.AI_DETECTOR_RETRY_COOLDOWN_SECONDS, e)
+         _detector = None
+     return _detector
+ 
+@@ -63,12 +81,23 @@ def predict_ai_generated(frame_path: str) -> float | None:
+     Callers (MAIN.py) must treat None as "check unavailable" and not as a
+     score of 0.0 — those mean very different things (no information vs.
+     "confidently real").
++
++    The actual pipeline call is wrapped in a lock: run_analysis() calls
++    this once per sampled frame from a single thread, but multiple
++    concurrent /analyze requests each land in their own threadpool worker
++    thread (see MAIN.py) and would otherwise all call into this same
++    shared pipeline object at once. Most inference runtimes tolerate that
++    fine, but HF pipelines wrapping a PyTorch model aren't guaranteed
++    thread-safe for concurrent forward passes on shared internal state —
++    serializing calls here trades a little throughput under concurrent load
++    for not having to verify that guarantee.
+     """
+     model = _get_model()
+     if model is None:
+         return None
+     try:
+-        result = model(frame_path)[0]
++        with _inference_lock:
++            result = model(frame_path)[0]
+         if result['label'] == 'artificial':
+             return round(result['score'], 4)
+         else:
+diff --git a/FIRE_DETECTOR.py b/FIRE_DETECTOR.py
+index 9cac030..f825758 100644
+--- a/FIRE_DETECTOR.py
++++ b/FIRE_DETECTOR.py
+@@ -25,6 +25,7 @@ score plus any localized fire bounding boxes.
+ import os
+ import json
+ import logging
++import threading
+ 
+ import cv2
+ import numpy as np
+@@ -34,6 +35,10 @@ import config
+ 
+ logger = logging.getLogger("main.fire_detector")
+ 
++# Serializes calls into the shared Keras model object across concurrent
++# /analyze requests — see predict_fire_batch's docstring for why.
++_inference_lock = threading.Lock()
++
+ class ModelLoadError(Exception):
+     """Custom exception raised when a model fails to load properly."""
+     pass
+@@ -218,6 +223,17 @@ def predict_fire_batch(frame_paths: list, model) -> list:
+     indexed by original position is used instead of appending, so a failed
+     frame partway through a batch can't shift everything after it out of
+     order.
++
++    The actual model.predict() call is wrapped in a lock: multiple
++    concurrent /analyze requests each run in their own threadpool worker
++    thread (see MAIN.py) and would otherwise call into this same shared
++    Keras model object at once. TensorFlow/Keras models aren't documented
++    as safe for concurrent predict() calls on one instance from multiple
++    threads — serializing here trades a little throughput under concurrent
++    load for not needing a per-request model instance or independently
++    verifying thread-safety. Only the predict() call itself is inside the
++    lock; image loading/decoding above and box localization below stay
++    outside it so they can still happen concurrently across requests.
+     """
+     if model is None:
+         raise ModelLoadError("Inference failed: Fire model layout not initialized.")
+@@ -243,7 +259,8 @@ def predict_fire_batch(frame_paths: list, model) -> list:
+             continue
+ 
+         try:
+-            predictions = model.predict(np.stack(images, axis=0), verbose=0)
++            with _inference_lock:
++                predictions = model.predict(np.stack(images, axis=0), verbose=0)
+         except Exception as e:
+             logger.warning("Batch prediction failed for %d frame(s): %s", len(images), e)
+             for idx in good_indices:
+diff --git a/MAIN.py b/MAIN.py
+index 38890a8..28a8594 100644
+--- a/MAIN.py
++++ b/MAIN.py
+@@ -6,15 +6,16 @@ it wires together the three detection modules (FIRE_DETECTOR,
+ PEOPLE_DETECTOR, AI_DETECTOR) around one HTTP endpoint.
+ 
+ Request flow for POST /analyze:
+-  1. Validate the upload's extension and enforce the size limit while
++  1. (Optional, if configured) API key + rate limit checks — cheap, so they
++     run before any file I/O at all.
++  2. Validate the upload's extension and enforce the size limit while
+      streaming it to a temp file.
+-  2. Sniff the file's magic bytes to confirm it's really a video of the
++  3. Sniff the file's magic bytes to confirm it's really a video of the
+      claimed type (not just correctly-named).
+-  3. extract_frames() decodes the video and samples it down to
+-     config.TARGET_FPS, saving each sampled frame as a JPEG.
+-  4. run_analysis() runs the three models over those frames and combines
+-     the results into one verdict — this is the part offloaded to a
+-     threadpool (see run_analysis's docstring for why).
++  4. run_analysis() runs a small AI-generated sample check first, then
++     (unless the clip is flagged) extract_frames() + the fire/people
++     models — this is the part offloaded to a threadpool (see
++     run_analysis's docstring for why).
+   5. The JSON result (scores, boxes, timeline, verdict) is returned to the
+      client — in this project's case, UI.py's Streamlit frontend.
+ 
+@@ -26,17 +27,20 @@ reloading it from scratch.
+ import logging
+ import tempfile
+ import time
++from collections import defaultdict, deque
+ from pathlib import Path
++from typing import Optional
+ 
+ import cv2
+-from fastapi import FastAPI, File, HTTPException, UploadFile
++from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+ from fastapi.concurrency import run_in_threadpool
+ from fastapi.middleware.cors import CORSMiddleware
++from pydantic import BaseModel
+ 
+ import config
+ from AI_DETECTOR import predict_ai_generated
+ from FIRE_DETECTOR import ModelLoadError, load_fire_model, predict_fire_batch
+-from PEOPLE_DETECTOR import load_people_model, predict_people_near_fire
++from PEOPLE_DETECTOR import is_using_fallback_weights, load_people_model, predict_people_near_fire
+ 
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+ logger = logging.getLogger("main")
+@@ -58,30 +62,219 @@ fire_model = load_fire_model(config.FIRE_MODEL_PATH)
+ people_model = load_people_model(config.PEOPLE_MODEL_PATH)
+ 
+ 
+-def _sniff_video_content(video_path: Path) -> bool:
++# ── Response schema ──────────────────────────────────────────────────────
++# A Pydantic model (instead of returning a plain dict) gets three things
++# for free: (1) FastAPI auto-generates accurate OpenAPI docs at /docs from
++# this shape, (2) the response is validated against it before being sent —
++# if run_analysis's dict ever drifted from this shape, that's now a loud
++# server error instead of a silent shape-mismatch the frontend has to
++# debug, and (3) anyone reading this file top-to-bottom sees the exact
++# contract of /analyze in one place, without needing to trace it back
++# through run_analysis's return statement.
++class AnalyzeResponse(BaseModel):
++    fire_detected: bool
++    fire_check_skipped: bool
++    max_fire_confidence: float
++    fire_flagged_frames: list[int]
++    fire_confidence_timeline: list[float]
++    people_detected: bool
++    people_check_skipped: bool
++    people_near_fire: bool
++    peak_people_count: int
++    closest_person_to_fire_px: Optional[float]
++    ai_generated_probability: Optional[float]
++    ai_check_available: bool
++    total_frames_analyzed: int
++    processing_time_seconds: float
++    verdict: str
++
++
++# ── Lightweight per-IP rate limiter for /analyze ─────────────────────────
++# /analyze is the expensive endpoint (up to three model inferences per
++# request), so it's the one worth protecting. This is intentionally simple
++# — an in-memory fixed-window counter per client IP — rather than pulling
++# in a dedicated rate-limiting library, since the whole feature is opt-in
++# and off by default (config.RATE_LIMIT_PER_MINUTE == 0). Being in-memory
++# means it resets on restart and doesn't share state across multiple
++# server processes/replicas — fine for a single-instance deployment (which
++# is what this project targets), but wouldn't be sufficient behind a
++# multi-replica load balancer without a shared store (e.g. Redis) instead.
++_request_log: dict[str, deque] = defaultdict(deque)
++
++
++def _check_rate_limit(client_ip: str) -> None:
++    """
++    Raises HTTPException(429) if `client_ip` has made more than
++    config.RATE_LIMIT_PER_MINUTE requests to /analyze in the last 60
++    seconds. No-ops entirely if RATE_LIMIT_PER_MINUTE is 0 (the default),
++    so this has zero effect on local/demo use unless explicitly configured.
++
++    Uses a deque of request timestamps per IP: each call first drops
++    timestamps older than 60s off the front (they're in chronological
++    order, so this is O(expired) not O(all requests ever)), then checks
++    whether what's left is already at the limit.
++    """
++    if config.RATE_LIMIT_PER_MINUTE <= 0:
++        return
++
++    now = time.monotonic()
++    window = _request_log[client_ip]
++    while window and now - window[0] > 60:
++        window.popleft()
++
++    if len(window) >= config.RATE_LIMIT_PER_MINUTE:
++        raise HTTPException(
++            status_code=429,
++            detail=f"Rate limit exceeded: max {config.RATE_LIMIT_PER_MINUTE} requests/minute per client.",
++        )
++
++    window.append(now)
++
++
++def _check_api_key(provided_key: str | None) -> None:
++    """
++    Raises HTTPException(401) if config.API_KEY is set (auth enabled) and
++    the request's X-API-Key header doesn't match it. No-ops if API_KEY is
++    unset/None (the default), so plain local/demo use needs no header at
++    all unless FIRE_DETECTOR_API_KEY is explicitly set in the environment.
++    """
++    if config.API_KEY is None:
++        return
++    if provided_key != config.API_KEY:
++        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header.")
++
++
++def _sniff_video_content(video_path: Path, claimed_ext: str) -> bool:
+     """
+     Confirms a saved upload's actual byte content matches a known video
+-    container format, as a check on top of (not instead of) the file
++    container format *and* that the container type is consistent with the
++    upload's claimed extension, as a check on top of (not instead of) the
+     extension check in analyze_video(). The extension alone is just
+     metadata the client provided and can't be trusted — this looks at the
+-    first bytes of the file itself, which is much harder to spoof by
+-    accident (e.g. a plain text file simply renamed to .mp4).
++    file's own bytes, which are much harder to spoof by accident (e.g. a
++    plain text file renamed to .mp4, or a .avi file renamed to .mp4).
++
++    Reads config.VIDEO_MAGIC_BYTES, a list of (byte_offset, magic_bytes,
++    valid_extensions) tuples. A match requires both that some known
++    signature is found at its expected offset AND that claimed_ext is
++    one of that signature's valid_extensions — finding *a* valid video
++    signature isn't enough on its own if it doesn't match what the client
++    claimed the file was.
+     """
+     try:
+         with video_path.open("rb") as f:
+-            header = f.read(12)
++            header = f.read(16)
+     except OSError:
+         return False
+ 
+-    if header[:4] == b"RIFF" and header[8:12] == b"AVI ":
+-        return True
+-    if header[4:8] == b"ftyp":  # covers .mp4 and .mov (ISO base media format)
+-        return True
+-    if header[:4] == b"\x1a\x45\xdf\xa3":  # Matroska/.mkv EBML header
+-        return True
++    for offset, magic, valid_extensions in config.VIDEO_MAGIC_BYTES:
++        if header[offset:offset + len(magic)] != magic:
++            continue
++        if magic == b"RIFF":
++            # RIFF alone isn't AVI-specific (WAV files share it too) — the
++            # four bytes right after the RIFF size field must spell "AVI ".
++            if header[8:12] != b"AVI ":
++                continue
++        return claimed_ext in valid_extensions
++
+     return False
+ 
+ 
++def _get_video_duration_seconds(video_path: Path) -> float | None:
++    """
++    Cheaply reads a video's reported duration from its container metadata
++    (frame_count / fps) without decoding any actual frame data. Used once,
++    up front in run_analysis, to enforce config.MAX_VIDEO_DURATION_SECONDS
++    before *either* extraction function below does any real decode work —
++    checking this once here (rather than duplicating it inside both
++    extract_sample_frames and extract_frames) means a too-long video is
++    rejected before paying for even the lightweight AI-sample seek pass.
++
++    Returns None if the file can't be opened or the container doesn't
++    report a usable frame count (some containers leave it at 0) — callers
++    should treat None as "unknown, proceed" rather than "zero duration."
++    A video that's actually oversized despite unreliable duration metadata
++    is still caught downstream by MAX_UPLOAD_MB and by MAX_EXTRACTED_FRAMES
++    as a hard backstop inside extract_frames.
++    """
++    cap = cv2.VideoCapture(str(video_path))
++    if not cap.isOpened():
++        cap.release()
++        return None
++
++    source_fps = cap.get(cv2.CAP_PROP_FPS)
++    if source_fps <= 0 or source_fps > 240:
++        source_fps = 30.0
++    reported_frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
++    cap.release()
++
++    if reported_frame_count <= 0:
++        return None
++    return reported_frame_count / source_fps
++
++
++def extract_sample_frames(video_path: Path, sample_size: int | None = None) -> list[Path]:
++    """
++    Decodes just `sample_size` frames (default config.AI_SAMPLE_SIZE),
++    evenly spaced across the video's full duration, via direct frame
++    seeking (CAP_PROP_POS_FRAMES) rather than reading and discarding every
++    frame in between.
++
++    This exists specifically so the AI-generated check can run BEFORE
++    paying the cost of extract_frames()'s full TARGET_FPS downsample. Per
++    run_analysis: if a clip turns out to be flagged as AI-generated,
++    extract_frames() is never called at all for it — this function is the
++    piece that makes that skip actually save I/O, not just save the
++    fire/people model calls that would have used the frames.
++
++    Frame indices are computed from the video's reported total frame count
++    (CAP_PROP_FRAME_COUNT). Seeking isn't always frame-exact on every
++    codec/container (B-frame-heavy streams in particular can land a frame
++    or two off the requested index) — an acceptable trade here, since the
++    AI-generated check only needs a representative sample, not frame-exact
++    indexing. If the reported frame count is unavailable (0 or negative —
++    some containers don't populate it), falls back to reading sequentially
++    from the start instead of seeking blind into the unknown.
++    """
++    if sample_size is None:
++        sample_size = config.AI_SAMPLE_SIZE
++
++    frame_paths: list[Path] = []
++    cap = cv2.VideoCapture(str(video_path))
++    if not cap.isOpened():
++        return frame_paths
++
++    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
++
++    if total > 0:
++        n = min(sample_size, int(total))
++        # A set-then-sort dedupes indices that can collide when the video
++        # has fewer frames than requested samples (n already caps that, but
++        # rounding from `i * total / n` can still occasionally repeat).
++        indices = sorted({int(i * total / n) for i in range(n)})
++        for i, idx in enumerate(indices):
++            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
++            ret, frame = cap.read()
++            if not ret:
++                continue
++            frame_path = video_path.parent / f"ai_sample_{i}.jpg"
++            cv2.imwrite(str(frame_path), frame)
++            frame_paths.append(frame_path)
++    else:
++        count = 0
++        while count < sample_size:
++            ret, frame = cap.read()
++            if not ret:
++                break
++            frame_path = video_path.parent / f"ai_sample_{count}.jpg"
++            cv2.imwrite(str(frame_path), frame)
++            frame_paths.append(frame_path)
++            count += 1
++
++    cap.release()
++    return frame_paths
++
++
+ def extract_frames(video_path: Path) -> list[Path]:
+     """
+     Decodes the video with OpenCV and writes out a downsampled subset of
+@@ -96,6 +289,17 @@ def extract_frames(video_path: Path) -> list[Path]:
+     FPS looks bogus (<=0 or absurdly high — corrupt metadata, an unusual
+     container), 30fps is assumed as a safe default instead of dividing by a
+     broken number.
++
++    Only called by run_analysis for clips that AREN'T flagged as
++    AI-generated (see extract_sample_frames' docstring) — the duration cap
++    itself is enforced once, earlier, via _get_video_duration_seconds, so
++    this function doesn't re-check it. config.MAX_EXTRACTED_FRAMES is
++    still enforced here directly, as a hard backstop independent of that
++    duration check — duration relies on the video's *reported* metadata
++    being accurate, which isn't always true for corrupt or unusual
++    containers, whereas this simply stops the decode loop once enough
++    frames have been written, regardless of what the video claims about
++    itself.
+     """
+     frame_paths = []
+     cap = cv2.VideoCapture(str(video_path))
+@@ -105,12 +309,13 @@ def extract_frames(video_path: Path) -> list[Path]:
+     source_fps = cap.get(cv2.CAP_PROP_FPS)
+     if source_fps <= 0 or source_fps > 240:
+         source_fps = 30.0
++
+     sample_rate = max(1, int(round(source_fps / config.TARGET_FPS)))
+ 
+     frame_count = 0
+     saved_count = 0
+ 
+-    while True:
++    while saved_count < config.MAX_EXTRACTED_FRAMES:
+         ret, frame = cap.read()
+         if not ret:
+             break
+@@ -140,55 +345,56 @@ def run_analysis(video_path: Path) -> dict:
+     while one video was being processed. Offloading it to a threadpool
+     keeps the event loop free.
+ 
+-    Stages, in order:
+-      - extract_frames(): decode + downsample the video (see above)
+-      - predict_fire_batch(): fire confidence + boxes per frame -> also
+-        builds the confidence timeline the UI charts
+-      - predict_people_near_fire(): only run on frames fire already
+-        flagged, since a "person near fire" check is meaningless on a frame
+-        with no fire in it
+-      - predict_ai_generated(): run on a small evenly-spaced sample of
+-        frames, then averaged into one clip-level AI-generated probability
+-      - a plain-English verdict string is assembled from all of the above
++    Stages, in order (this ordering is the important part — see each
++    step's comment below for why it's in this position):
++      1. Duration check — reject an overly long video before ANY decoding.
++      2. extract_sample_frames() — decode a SMALL sample (config.AI_SAMPLE_SIZE
++         frames, via direct seeking) just for the AI-generated check.
++      3. predict_ai_generated() on that sample -> one clip-level probability.
++      4. Decision point: if the clip is confidently AI-generated, STOP here
++         — fire/people detection is skipped entirely, and extract_frames()
++         (the expensive full downsample) is never even called.
++      5. Otherwise, extract_frames() decodes the full downsampled frame set,
++         and fire + people detection run on it as before.
++      6. A plain-English verdict string is assembled from all of the above.
+     """
+     start = time.monotonic()
+ 
+-    frames = extract_frames(video_path)
+-    if not frames:
++    # ── Step 1: duration guard, before any frame decoding happens ──
++    # Checked once, up front, rather than inside extract_sample_frames or
++    # extract_frames individually — this way a too-long video is rejected
++    # before paying for even the lightweight AI-sample seek pass below.
++    duration_seconds = _get_video_duration_seconds(video_path)
++    if duration_seconds is not None and duration_seconds > config.MAX_VIDEO_DURATION_SECONDS:
++        raise HTTPException(
++            status_code=400,
++            detail=(
++                f"Video is too long (~{duration_seconds:.0f}s). "
++                f"Max is {config.MAX_VIDEO_DURATION_SECONDS}s."
++            ),
++        )
++    # If duration_seconds is None, the container's metadata was unusable —
++    # proceeding here rather than blocking is deliberate: the file is still
++    # bounded by MAX_UPLOAD_MB (checked earlier, in analyze_video) and by
++    # MAX_EXTRACTED_FRAMES as a hard backstop inside extract_frames.
++
++    # ── Step 2: small, cheap sample just for the AI-generated check ──
++    # This is the efficiency fix: previously, the pipeline always ran
++    # extract_frames() first (decoding + writing every TARGET_FPS frame to
++    # disk for the WHOLE video) before it even knew whether the clip would
++    # turn out to be AI-generated and have fire/people skipped anyway. Now,
++    # only this small evenly-spaced sample is decoded first — if the clip
++    # gets flagged, the full extraction below never runs at all.
++    ai_sample = extract_sample_frames(video_path)
++    if not ai_sample:
++        # Video couldn't be opened / has no readable frames at all — this
++        # is a genuinely broken upload, not just "no AI signal available."
+         raise HTTPException(status_code=400, detail="Could not extract frames from video.")
+-    logger.info("Extracted %d frames from %s, starting inference", len(frames), video_path.name)
+-
+-    # Fire detection + per-frame timeline (also powers the UI's confidence chart)
+-    fire_results = predict_fire_batch([str(f) for f in frames], fire_model)
+-    fire_scores = [r["fire_confidence"] for r in fire_results]
+-    fire_flagged = [idx for idx, s in enumerate(fire_scores) if s > config.FIRE_CONFIDENCE_THRESHOLD]
+-    max_fire_conf = round(max(fire_scores), 4) if fire_scores else 0.0
+-    fire_timeline = [round(s, 4) for s in fire_scores]
+-
+-    # People detection + proximity, run only on fire-flagged frames — see
+-    # run_analysis docstring for why this is scoped down instead of running
+-    # on every frame.
+-    people_detected = False
+-    people_near_fire = False
+-    max_people_count = 0
+-    closest_proximity_px = None
+-
+-    for idx in fire_flagged:
+-        fire_boxes = fire_results[idx].get("fire_boxes", [])
+-        result = predict_people_near_fire(str(frames[idx]), fire_boxes)
+-        if result["people_detected"]:
+-            people_detected = True
+-            max_people_count = max(max_people_count, result["people_count"])
+-        if result["people_near_fire"]:
+-            people_near_fire = True
+-        if result["closest_person_to_fire_px"] is not None:
+-            if closest_proximity_px is None or result["closest_person_to_fire_px"] < closest_proximity_px:
+-                closest_proximity_px = result["closest_person_to_fire_px"]
+-
+-    # AI-generated detection: sampled, evenly spaced across the whole clip
+-    # (not just the first N frames), so the sample is representative of the
+-    # video as a whole rather than biased toward its opening seconds.
+-    ai_sample = frames[:: max(1, len(frames) // config.AI_SAMPLE_SIZE)][:config.AI_SAMPLE_SIZE]
++
++    # ── Step 3: run the AI-generated classifier on the sample ──
++    # predict_ai_generated returns None per-frame if the model itself isn't
++    # loaded (see AI_DETECTOR.py) — those are filtered out before averaging
++    # so a handful of unavailable frames doesn't corrupt the score with 0s.
+     ai_scores = [predict_ai_generated(str(f)) for f in ai_sample]
+     valid_ai_scores = [s for s in ai_scores if s is not None]
+     ai_check_available = len(valid_ai_scores) > 0
+@@ -197,60 +403,148 @@ def run_analysis(video_path: Path) -> dict:
+     if not ai_check_available:
+         logger.warning("AI-generated check unavailable for %s — ai_detector model not loaded", video_path.name)
+ 
+-    # Verdict: fire + people-proximity status is decided first (it's the
+-    # more "objective" physical read of the footage), then the AI-generated
+-    # check can override it entirely, since synthetic footage makes the
+-    # fire/people findings themselves untrustworthy regardless of what they
+-    # say.
+-    fire_detected = len(fire_flagged) > 0
+-    if fire_detected and people_near_fire:
+-        real_footage_verdict = "Real footage — fire detected with people in proximity"
+-    elif fire_detected and people_detected:
+-        real_footage_verdict = "Real footage — fire detected with people present"
+-    elif fire_detected:
+-        real_footage_verdict = "Real footage — fire detected, no people present"
++    # ── Step 4: the skip decision ──
++    # Only skip fire/people detection when the AI check actually ran AND
++    # came back above threshold — an unavailable check (model not loaded)
++    # gives no signal to skip on, so fire/people still run as normal in
++    # that case rather than the whole pipeline going dark just because one
++    # optional model failed to load.
++    is_ai_generated = ai_check_available and avg_ai_score > config.AI_GENERATED_THRESHOLD
++
++    if is_ai_generated:
++        # Flagged as AI-generated: fire/people detection is skipped
++        # entirely. extract_frames() (the expensive full-video downsample)
++        # is simply never called in this branch — that's the actual I/O
++        # saving, not just skipping the model calls.
++        logger.info(
++            "%s flagged as AI-generated (%.2f > %.2f) — skipping fire/people detection",
++            video_path.name, avg_ai_score, config.AI_GENERATED_THRESHOLD,
++        )
++        fire_detected = False
++        max_fire_conf = 0.0
++        fire_flagged: list[int] = []
++        fire_timeline: list[float] = []
++        people_detected = False
++        people_near_fire = False
++        max_people_count = 0
++        closest_proximity_px = None
++        fire_check_skipped = True
++        people_check_skipped = True
++        # total_frames_analyzed reflects what was ACTUALLY decoded and
++        # analyzed in this branch — just the small AI sample, not a full
++        # TARGET_FPS extraction that never happened.
++        total_frames_analyzed = len(ai_sample)
+     else:
+-        real_footage_verdict = "Real footage — no fire detected"
+-
+-    if not ai_check_available:
+-        verdict = f"{real_footage_verdict} (AI-generated check unavailable)"
+-    elif avg_ai_score > config.AI_GENERATED_THRESHOLD:
+-        verdict = "AI-generated footage"
++        # ── Step 5: not flagged (or AI check unavailable) — full pipeline ──
++        # Only NOW do we pay for the full, expensive frame extraction.
++        frames = extract_frames(video_path)
++        if not frames:
++            raise HTTPException(status_code=400, detail="Could not extract frames from video.")
++        logger.info("Extracted %d frames from %s, starting inference", len(frames), video_path.name)
++
++        # Fire detection + per-frame timeline (also powers the UI's confidence chart).
++        # predict_fire_batch runs the Keras classifier over every extracted
++        # frame in batches (see FIRE_DETECTOR.py for why batching matters).
++        fire_results = predict_fire_batch([str(f) for f in frames], fire_model)
++        fire_scores = [r["fire_confidence"] for r in fire_results]
++        fire_flagged = [idx for idx, s in enumerate(fire_scores) if s > config.FIRE_CONFIDENCE_THRESHOLD]
++        max_fire_conf = round(max(fire_scores), 4) if fire_scores else 0.0
++        fire_timeline = [round(s, 4) for s in fire_scores]
++        fire_detected = len(fire_flagged) > 0
++
++        # People detection + proximity, run only on fire-flagged frames — a
++        # "person near fire" check is meaningless on a frame with no fire in
++        # it in the first place.
++        people_detected = False
++        people_near_fire = False
++        max_people_count = 0
++        closest_proximity_px = None
++
++        for idx in fire_flagged:
++            fire_boxes = fire_results[idx].get("fire_boxes", [])
++            result = predict_people_near_fire(str(frames[idx]), fire_boxes)
++            if result["people_detected"]:
++                people_detected = True
++                max_people_count = max(max_people_count, result["people_count"])
++            if result["people_near_fire"]:
++                people_near_fire = True
++            if result["closest_person_to_fire_px"] is not None:
++                if closest_proximity_px is None or result["closest_person_to_fire_px"] < closest_proximity_px:
++                    closest_proximity_px = result["closest_person_to_fire_px"]
++
++        fire_check_skipped = False
++        people_check_skipped = False
++        total_frames_analyzed = len(frames)
++
++    # ── Step 6: assemble the plain-English verdict ──
++    # An AI-generated flag takes priority and says so explicitly — fire/
++    # people weren't just "not found," they were never checked, which is a
++    # meaningfully different claim than "real footage, no fire."
++    if is_ai_generated:
++        verdict = "AI-generated footage — fire/people detection skipped"
+     else:
+-        verdict = real_footage_verdict
++        if fire_detected and people_near_fire:
++            real_footage_verdict = "Real footage — fire detected with people in proximity"
++        elif fire_detected and people_detected:
++            real_footage_verdict = "Real footage — fire detected with people present"
++        elif fire_detected:
++            real_footage_verdict = "Real footage — fire detected, no people present"
++        else:
++            real_footage_verdict = "Real footage — no fire detected"
++
++        if not ai_check_available:
++            verdict = f"{real_footage_verdict} (AI-generated check unavailable)"
++        else:
++            verdict = real_footage_verdict
+ 
+     elapsed = round(time.monotonic() - start, 2)
+-    logger.info("Analyzed %d frames in %.2fs — verdict: %s", len(frames), elapsed, verdict)
++    logger.info("Analyzed %d frames in %.2fs — verdict: %s", total_frames_analyzed, elapsed, verdict)
+ 
+     return {
+         "fire_detected": fire_detected,
++        "fire_check_skipped": fire_check_skipped,
+         "max_fire_confidence": max_fire_conf,
+         "fire_flagged_frames": fire_flagged,
+         "fire_confidence_timeline": fire_timeline,
+         "people_detected": people_detected,
++        "people_check_skipped": people_check_skipped,
+         "people_near_fire": people_near_fire,
+         "peak_people_count": max_people_count,
+         "closest_person_to_fire_px": closest_proximity_px,
+         "ai_generated_probability": avg_ai_score,
+         "ai_check_available": ai_check_available,
+-        "total_frames_analyzed": len(frames),
++        "total_frames_analyzed": total_frames_analyzed,
+         "processing_time_seconds": elapsed,
+         "verdict": verdict,
+     }
+ 
+ 
+-@app.post("/analyze")
+-async def analyze_video(file: UploadFile = File(...)):
++@app.post("/analyze", response_model=AnalyzeResponse)
++async def analyze_video(
++    request: Request,
++    file: UploadFile = File(...),
++    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
++):
+     """
+     Accepts a multipart video upload (field name "file"), validates it, runs
+     the full detection pipeline, and returns the combined JSON result
+-    described in run_analysis()'s docstring.
++    described in run_analysis()'s docstring (shape enforced by the
++    AnalyzeResponse model above).
+ 
+     Validation happens in layers, cheapest checks first, so an obviously bad
+-    request is rejected before any expensive work: extension check -> model-
+-    loaded check -> streamed size-limit check while saving -> magic-byte
+-    content check -> only then does the actual (slow) analysis run.
++    request is rejected before any expensive work: API key -> rate limit ->
++    extension check -> model-loaded check -> streamed size-limit check while
++    saving -> magic-byte content check -> only then does the actual (slow)
++    analysis run.
+     """
++    # Both of these are cheap, in-memory checks and no-op entirely unless
++    # explicitly configured (see config.API_KEY / config.RATE_LIMIT_PER_MINUTE)
++    # — so they run first, before any file I/O, and have zero effect on the
++    # project's default local/demo setup.
++    _check_api_key(x_api_key)
++    client_ip = request.client.host if request.client else "unknown"
++    _check_rate_limit(client_ip)
++
+     if not file.filename:
+         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
+ 
+@@ -263,6 +557,12 @@ async def analyze_video(file: UploadFile = File(...)):
+             status_code=503,
+             detail="Fire detection model is not loaded on the server. Check server logs.",
+         )
++    # people_model itself is never None (see PEOPLE_DETECTOR.load_people_model
++    # — a failed custom load falls back to yolov8n.pt rather than leaving
++    # the model unset), so there's no equivalent hard-fail check here. If
++    # the custom weights failed, is_using_fallback_weights() is surfaced via
++    # /health instead, since the request can still be served — just with
++    # generic COCO person-detection instead of the trained weights.
+ 
+     with tempfile.TemporaryDirectory() as temp_dir:
+         temp_path = Path(temp_dir)
+@@ -285,7 +585,7 @@ async def analyze_video(file: UploadFile = File(...)):
+                     raise HTTPException(status_code=413, detail=f"File too large. Max is {config.MAX_UPLOAD_MB} MB.")
+                 buffer.write(chunk)
+ 
+-        if not _sniff_video_content(video_path):
++        if not _sniff_video_content(video_path, ext):
+             raise HTTPException(
+                 status_code=400,
+                 detail=f"File extension '{ext}' doesn't match actual file content — is this really a video file?",
+@@ -296,6 +596,21 @@ async def analyze_video(file: UploadFile = File(...)):
+         except ModelLoadError as e:
+             logger.error("Model error during analysis: %s", e)
+             raise HTTPException(status_code=503, detail=str(e))
++        except HTTPException:
++            # Already a deliberate, well-formed error (e.g. the "could not
++            # extract frames" / duration-limit checks inside run_analysis) —
++            # re-raise as-is instead of letting the broad except below
++            # relabel it as a generic 500.
++            raise
++        except Exception as e:
++            # Anything else unexpected mid-inference (a corrupt frame that
++            # slips past validation, a model-specific quirk, an out-of-memory
++            # error, etc). Without this, an exception raised inside the
++            # threadpool would propagate all the way up as a raw traceback
++            # instead of a clean HTTP response — logged in full detail
++            # server-side, but the client only ever sees a generic message.
++            logger.exception("Unexpected error during analysis of %s", video_path.name)
++            raise HTTPException(status_code=500, detail="Analysis failed unexpectedly. Check server logs.")
+ 
+ 
+ @app.get("/")
+@@ -313,8 +628,19 @@ def health():
+     Reports per-model load status so the frontend (UI.py) can show an
+     accurate "system online" indicator instead of a static badge that
+     doesn't reflect whether the backend can actually serve a real request.
++
++    people_model_loaded is always True once load_people_model() has run —
++    unlike the fire model, a failed custom-weights load doesn't leave
++    people_model as None, it falls back to the generic yolov8n.pt so
++    /analyze keeps working (see PEOPLE_DETECTOR.load_people_model). That
++    fallback is silent to /analyze callers but shouldn't be silent here:
++    people_model_using_fallback tells the frontend (and anyone hitting this
++    endpoint directly) that person-detection is running on generic 80-class
++    COCO weights rather than the project's trained model, which matters a
++    lot for anyone judging accuracy against this project's own footage.
+     """
+     return {
+         "fire_model_loaded": fire_model is not None,
+         "people_model_loaded": people_model is not None,
++        "people_model_using_fallback": is_using_fallback_weights(),
+     }
+diff --git a/PEOPLE_DETECTOR.py b/PEOPLE_DETECTOR.py
+index fae9770..b56c9e7 100644
+--- a/PEOPLE_DETECTOR.py
++++ b/PEOPLE_DETECTOR.py
+@@ -10,6 +10,7 @@ frame regardless of fire content would be wasted compute, since the
+ place.
+ """
+ import logging
++import threading
+ 
+ from ultralytics import YOLO
+ 
+@@ -19,6 +20,15 @@ logger = logging.getLogger("people_detector")
+ 
+ _model = None
+ _weights_path = config.PEOPLE_MODEL_PATH
++# True once load_people_model() has fallen back to the generic yolov8n.pt
++# because the custom weights failed to load. Tracked separately from
++# `_model is None` (which is never true after a load attempt, by design —
++# see load_people_model) so callers like MAIN.py's /health can tell "a
++# model is loaded" apart from "the *intended* model is loaded".
++_using_fallback = False
++# Serializes calls into the shared YOLO model object — see the docstring on
++# predict_people_near_fire for why.
++_inference_lock = threading.Lock()
+ 
+ # Both the custom-trained weights and the yolov8n.pt fallback report a class
+ # literally named "person" (index 0 in standard COCO; the custom model was
+@@ -46,18 +56,38 @@ def load_people_model(weights_path: str = config.PEOPLE_MODEL_PATH):
+     this once, for one weights file, at process startup — the model is
+     meant to be loaded a single time and reused across all requests, not
+     reloaded per-request.
++
++    Whether the fallback was actually used is recorded in the module-level
++    `_using_fallback` flag (read via is_using_fallback_weights()) rather
++    than only being logged — a silently-degraded person detector matters
++    enough here (this is a safety-adjacent tool) that it should be
++    queryable at runtime, not just discoverable by reading server logs.
+     """
+-    global _model, _weights_path
++    global _model, _weights_path, _using_fallback
+     _weights_path = weights_path
+     try:
+         _model = YOLO(weights_path)
++        _using_fallback = False
+         logger.info("People model loaded successfully from %s", weights_path)
+     except Exception as e:
+         logger.error("People model '%s' failed to load, falling back to yolov8n.pt: %s", weights_path, e)
+         _model = YOLO("yolov8n.pt")
++        _using_fallback = True
+     return _model
+ 
+ 
++def is_using_fallback_weights() -> bool:
++    """
++    True if the active model is the generic yolov8n.pt fallback rather than
++    the project's custom-trained weights — i.e. the custom weights failed
++    to load. Exposed so callers (MAIN.py's /health) can surface this to
++    anyone judging the pipeline's real-world accuracy: "a person model is
++    loaded" and "the *trained* person model is loaded" are different claims,
++    and only this flag distinguishes them.
++    """
++    return _using_fallback
++
++
+ def _box_gap(box_a: list[float], box_b: list[float]) -> float:
+     """
+     Shortest Euclidean distance between the edges of two axis-aligned boxes,
+@@ -89,11 +119,23 @@ def predict_people_near_fire(frame_path: str, fire_boxes: list[dict]) -> dict:
+     enough to flag the frame but the HSV localizer didn't find a matching
+     color region — in that case no proximity check is possible and
+     people_near_fire is reported as False even if people are present.
++
++    The actual YOLO call is wrapped in a lock: MAIN.py's run_analysis calls
++    this once per fire-flagged frame from a single thread, but multiple
++    concurrent /analyze requests each run in their own threadpool worker
++    thread and would otherwise call into this same shared `_model` object
++    at once. Ultralytics' YOLO wraps a PyTorch model and isn't documented
++    as safe for concurrent inference calls from multiple threads on one
++    instance — serializing here trades a little throughput under
++    concurrent load for not needing a per-request model instance (which
++    would cost real memory, especially on the project's target 4GB-VRAM
++    GPU) or having to independently verify thread-safety.
+     """
+     if _model is None:
+         load_people_model(_weights_path)
+ 
+-    results = _model(frame_path, verbose=False)
++    with _inference_lock:
++        results = _model(frame_path, verbose=False)
+     people_boxes = []
+ 
+     for result in results:
+diff --git a/README.md b/README.md
+index 3b85890..817fcfe 100644
+--- a/README.md
++++ b/README.md
+@@ -7,16 +7,25 @@ FastAPI backend + Streamlit frontend that analyzes a video for:
+ 
+ ## How it works
+ 
+-A video upload is decoded and downsampled to `TARGET_FPS` frames. Each
+-frame runs through the fire classifier, producing a per-frame confidence
+-score and (on flagged frames) fire bounding boxes via classical HSV color
+-thresholding. Frames flagged as containing fire are then passed to the
+-people detector, which finds person bounding boxes and checks their
+-distance to the fire boxes. Separately, a small evenly-spaced sample of
+-frames is run through the AI-generated-image classifier and averaged into
+-one probability. All of this is combined into a single JSON verdict — see
+-`MAIN.py`'s module docstring for the full request flow, and each detector
+-module's docstring for how its piece works.
++A small, evenly-spaced sample of frames (`AI_SAMPLE_SIZE`, decoded via
++direct frame seeking, not a full extraction) is run through the
++AI-generated-image classifier first and averaged into one clip-level
++probability. **If that probability clears `AI_GENERATED_THRESHOLD`, fire
++and people detection are skipped entirely** — the video is decoded and
++downsampled to `TARGET_FPS` frames, and the fire/people pipeline below
++runs, only when the clip *isn't* flagged as AI-generated (or the
++AI-generated check itself is unavailable). This ordering means a clip
++confidently identified as synthetic never pays for the two more expensive
++models at all, rather than running them and discarding the result.
++
++When fire/people detection does run: each extracted frame runs through the
++fire classifier, producing a per-frame confidence score and (on flagged
++frames) fire bounding boxes via classical HSV color thresholding. Frames
++flagged as containing fire are then passed to the people detector, which
++finds person bounding boxes and checks their distance to the fire boxes.
++All of this is combined into a single JSON verdict — see `MAIN.py`'s module
++docstring for the full request flow, and each detector module's docstring
++for how its piece works.
+ 
+ ## Setup
+ 
+@@ -68,16 +77,25 @@ TRAINING3/
+ 
+ ## API
+ 
+-`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB.
++`POST /analyze` — multipart upload, field name `file`. Accepts `.mp4 .mov .avi .mkv`, max 100MB (see `MAX_VIDEO_DURATION_SECONDS` in `config.py` for the separate duration cap).
+ 
+-Returns:
++The AI-generated check runs *first*. If a clip is flagged as AI-generated,
++fire and people detection are skipped entirely rather than run against
++footage already known to be synthetic — `fire_check_skipped` /
++`people_check_skipped` are `true` in that case, and `fire_detected` /
++`people_detected` are `false` because they were never checked, not because
++nothing was found.
++
++Returns (a real, non-AI-generated clip with fire and people detected):
+ ```json
+ {
+   "fire_detected": true,
++  "fire_check_skipped": false,
+   "max_fire_confidence": 0.94,
+   "fire_flagged_frames": [3, 4, 5],
+   "fire_confidence_timeline": [0.1, 0.2, 0.94, ...],
+   "people_detected": true,
++  "people_check_skipped": false,
+   "people_near_fire": true,
+   "peak_people_count": 2,
+   "closest_person_to_fire_px": 45.2,
+@@ -89,10 +107,32 @@ Returns:
+ }
+ ```
+ 
++Returns (a clip flagged as AI-generated — fire/people checks skipped):
++```json
++{
++  "fire_detected": false,
++  "fire_check_skipped": true,
++  "max_fire_confidence": 0.0,
++  "fire_flagged_frames": [],
++  "fire_confidence_timeline": [],
++  "people_detected": false,
++  "people_check_skipped": true,
++  "people_near_fire": false,
++  "peak_people_count": 0,
++  "closest_person_to_fire_px": null,
++  "ai_generated_probability": 0.91,
++  "ai_check_available": true,
++  "total_frames_analyzed": 42,
++  "processing_time_seconds": 1.94,
++  "verdict": "AI-generated footage — fire/people detection skipped"
++}
++```
++
+ If the AI-generated model fails to load, `ai_check_available` is `false` and
+-`ai_generated_probability` is `null` — the verdict will say
+-"AI-generated check unavailable" instead of silently assuming the footage
+-is real.
++`ai_generated_probability` is `null` — fire/people detection runs as normal
++in that case (there's no AI-generated signal to skip on), and the verdict
++will say "AI-generated check unavailable" instead of silently assuming the
++footage is real.
+ 
+ `GET /health` — reports whether each model loaded successfully.
+ 
+@@ -144,3 +184,19 @@ tested against.
+ one `model.predict()` call. 16 is a reasonable starting point for a GTX
+ 1650 — raise it if you have headroom, lower it if you hit CUDA OOM errors.
+ See `config.py` for explanations of every other tunable value.
++
++## Optional API protection
++
++Both are **off by default** — no header or setup needed for local/demo use.
++Set the corresponding environment variable before starting the server to
++turn either on:
++
++| Env var | Effect |
++|---|---|
++| `FIRE_DETECTOR_API_KEY` | If set, every `/analyze` request must include a matching `X-API-Key` header, or it's rejected with `401`. |
++| `FIRE_DETECTOR_RATE_LIMIT_PER_MINUTE` | If set to a number > 0, caps `/analyze` requests per client IP to that many per rolling 60s window; excess requests get `429`. |
++
++The rate limiter is in-memory and per-process — it resets on restart and
++doesn't share state across multiple server replicas. Fine for the
++single-instance deployment this project targets; would need a shared store
++(e.g. Redis) behind a load balancer with more than one backend process.
+diff --git a/UI.py b/UI.py
+index ed0471a..227d63b 100644
+--- a/UI.py
++++ b/UI.py
+@@ -237,6 +237,15 @@ html, body, [class*="css"], .stApp{
+ # used to show regardless of whether the backend was actually up). The
+ # backend's CORS config already allows any origin, so this fetch from the
+ # browser works against a locally-running FastAPI server.
++#
++# Three states, not two: people_model_loaded alone can't tell a genuine
++# load failure apart from a silent fallback to generic yolov8n.pt weights
++# (see PEOPLE_DETECTOR.load_people_model / MAIN.py's /health docstring) —
++# both report people_model_loaded: true. The extra
++# people_model_using_fallback flag is what lets this distinguish "healthy"
++# from "technically running, but not with the trained model," which
++# matters a lot for anyone judging this project's actual detection
++# accuracy rather than just whether the server responds.
+ _health_script = """
+ <script>
+ fetch("__HEALTH_URL__")
+@@ -245,12 +254,15 @@ fetch("__HEALTH_URL__")
+     const dot = window.parent.document.getElementById("status-dot");
+     const txt = window.parent.document.getElementById("status-text");
+     if (!dot || !txt) return;
+-    if (d.fire_model_loaded && d.people_model_loaded) {
+-      txt.textContent = "All models online";
+-      dot.classList.add("dot-ok");
+-    } else {
++    if (!d.fire_model_loaded || !d.people_model_loaded) {
+       txt.textContent = "Backend up, a model failed to load";
+       dot.classList.add("dot-warn");
++    } else if (d.people_model_using_fallback) {
++      txt.textContent = "Online — using fallback person detector";
++      dot.classList.add("dot-warn");
++    } else {
++      txt.textContent = "All models online";
++      dot.classList.add("dot-ok");
+     }
+   })
+   .catch(() => {
+@@ -323,6 +335,15 @@ def render_dashboard(r: dict, filename: str):
+     """Renders the verdict card, metrics, chart, and frame chips for one result."""
+     ai_available = r.get("ai_check_available", True)
+     ai_prob = r.get("ai_generated_probability")
++    # Present once the backend flags a clip as AI-generated: fire/people
++    # detection isn't just "not found" in that case, it was never run at
++    # all (see MAIN.py's run_analysis — running expensive fire/people
++    # models against footage already known to be synthetic would only
++    # produce findings that need to be discarded). These flags drive the
++    # metrics and panels below so the UI doesn't imply "no fire" when the
++    # honest answer is "not checked."
++    fire_skipped = r.get("fire_check_skipped", False)
++    people_skipped = r.get("people_check_skipped", False)
+ 
+     # Verdict styling is driven off the structured fields the backend
+     # returns, not by substring-matching r["verdict"] — a check like
+@@ -339,6 +360,8 @@ def render_dashboard(r: dict, filename: str):
+     ai_flag_html = ""
+     if not ai_available:
+         ai_flag_html = '<div class="verd-subflag">⚠ AI-generated check unavailable — model not loaded</div>'
++    elif fire_skipped or people_skipped:
++        ai_flag_html = '<div class="verd-subflag">🚫 Fire/people detection skipped — footage flagged as AI-generated</div>'
+ 
+     # Kept as one line on purpose: st.markdown(unsafe_allow_html=True) parses
+     # raw HTML until it hits a blank line, then falls back to normal
+@@ -357,64 +380,87 @@ def render_dashboard(r: dict, filename: str):
+ 
+     c1, c2, c3, c4, c5 = st.columns(5)
+     with c1:
+-        st.metric("🔥 Fire", "Yes" if r["fire_detected"] else "No", f"{r['max_fire_confidence']*100:.1f}% conf")
++        if fire_skipped:
++            st.metric("🔥 Fire", "Skipped", "AI-generated")
++        else:
++            st.metric("🔥 Fire", "Yes" if r["fire_detected"] else "No", f"{r['max_fire_confidence']*100:.1f}% conf")
+     with c2:
+-        st.metric("🧍 People", "Yes" if r["people_detected"] else "No", f"Peak {r['peak_people_count']}")
++        if people_skipped:
++            st.metric("🧍 People", "Skipped", "AI-generated")
++        else:
++            st.metric("🧍 People", "Yes" if r["people_detected"] else "No", f"Peak {r['peak_people_count']}")
+     with c3:
+-        prox = r.get("closest_person_to_fire_px")
+-        st.metric("📏 Proximity", f"{prox:.0f}px" if prox is not None else "—",
+-                   "Near fire" if r["people_near_fire"] else "n/a")
++        if people_skipped:
++            st.metric("📏 Proximity", "—", "Skipped")
++        else:
++            prox = r.get("closest_person_to_fire_px")
++            st.metric("📏 Proximity", f"{prox:.0f}px" if prox is not None else "—",
++                       "Near fire" if r["people_near_fire"] else "n/a")
+     with c4:
+         ai_display = f"{ai_prob*100:.1f}%" if ai_prob is not None else "N/A"
+         st.metric("🎭 AI score", ai_display, None if ai_available else "unavailable")
+     with c5:
+         st.metric("🎞 Frames", r["total_frames_analyzed"], f"{r.get('processing_time_seconds', '—')}s")
+ 
+-    # ── fire confidence timeline (SVG sparkline) ──
+-    timeline = r.get("fire_confidence_timeline", [])
+-    if timeline:
+-        w, h, pad = 640, 120, 10
+-        n = len(timeline)
+-        step = (w - 2 * pad) / max(1, n - 1)
+-        pts = " ".join(
+-            f"{pad + i*step:.1f},{h - pad - v*(h - 2*pad):.1f}"
+-            for i, v in enumerate(timeline)
+-        )
+-        area_pts = f"{pad},{h-pad} " + pts + f" {w-pad},{h-pad}"
+-        thresh_y = h - pad - FIRE_CONFIDENCE_THRESHOLD * (h - 2 * pad)
+-        flagged_dots = "".join(
+-            f'<circle cx="{pad + i*step:.1f}" cy="{h - pad - timeline[i]*(h - 2*pad):.1f}" r="3.5" fill="var(--amber)" stroke="#fff" stroke-width="1" />'
+-            for i in r["fire_flagged_frames"]
+-        )
+-        st.markdown(f"""
+-        <div class="panel">
+-          <div class="p-title">Fire confidence — per frame</div>
+-          <svg viewBox="0 0 {w} {h}" style="width:100%;height:auto;display:block;">
+-            <line x1="{pad}" y1="{thresh_y:.1f}" x2="{w-pad}" y2="{thresh_y:.1f}"
+-                  stroke="#E0502B55" stroke-width="1" stroke-dasharray="4,4" />
+-            <polygon points="{area_pts}" fill="url(#fireGrad)" opacity="0.30" />
+-            <polyline points="{pts}" fill="none" stroke="#FF6B45" stroke-width="2.5" stroke-linejoin="round" />{flagged_dots}
+-            <defs>
+-              <linearGradient id="fireGrad" x1="0" y1="0" x2="0" y2="1">
+-                <stop offset="0%" stop-color="#FF6B45"/>
+-                <stop offset="100%" stop-color="#FF6B45" stop-opacity="0"/>
+-              </linearGradient>
+-            </defs>
+-          </svg>
+-        </div>""", unsafe_allow_html=True)
+-
+-    # Frame chips now actually populate — the backend used to hardcode
+-    # "fire_flagged_frames" to an empty list in its response even though it
+-    # had already computed the real list internally, so this section (and
+-    # the flagged dots on the chart above) silently never showed anything.
+-    # Fixed in MAIN.py alongside this.
+-    if r["fire_flagged_frames"]:
+-        chips = "".join(f'<span class="chip">#{str(i).zfill(2)}</span>' for i in r["fire_flagged_frames"])
+-        st.markdown(f"""
++    if fire_skipped:
++        # Replaces the sparkline chart + frame chips below — there's no
++        # per-frame fire data to show when the fire model never ran, and an
++        # empty chart/chip panel (or worse, no panel at all with no
++        # explanation) would read as a bug rather than a deliberate skip.
++        st.markdown("""
+         <div class="panel">
+-          <div class="p-title">Fire flagged frames — {len(r["fire_flagged_frames"])} / {r["total_frames_analyzed"]}</div>
+-          <div class="chips">{chips}</div>
++          <div class="p-title">Fire / people detection</div>
++          <div style="font-size:13px;color:var(--ink-soft);">
++            Skipped — this clip was flagged as AI-generated, so fire and
++            people checks weren't run against it.
++          </div>
+         </div>""", unsafe_allow_html=True)
++    else:
++        # ── fire confidence timeline (SVG sparkline) ──
++        timeline = r.get("fire_confidence_timeline", [])
++        if timeline:
++            w, h, pad = 640, 120, 10
++            n = len(timeline)
++            step = (w - 2 * pad) / max(1, n - 1)
++            pts = " ".join(
++                f"{pad + i*step:.1f},{h - pad - v*(h - 2*pad):.1f}"
++                for i, v in enumerate(timeline)
++            )
++            area_pts = f"{pad},{h-pad} " + pts + f" {w-pad},{h-pad}"
++            thresh_y = h - pad - FIRE_CONFIDENCE_THRESHOLD * (h - 2 * pad)
++            flagged_dots = "".join(
++                f'<circle cx="{pad + i*step:.1f}" cy="{h - pad - timeline[i]*(h - 2*pad):.1f}" r="3.5" fill="var(--amber)" stroke="#fff" stroke-width="1" />'
++                for i in r["fire_flagged_frames"]
++            )
++            st.markdown(f"""
++            <div class="panel">
++              <div class="p-title">Fire confidence — per frame</div>
++              <svg viewBox="0 0 {w} {h}" style="width:100%;height:auto;display:block;">
++                <line x1="{pad}" y1="{thresh_y:.1f}" x2="{w-pad}" y2="{thresh_y:.1f}"
++                      stroke="#E0502B55" stroke-width="1" stroke-dasharray="4,4" />
++                <polygon points="{area_pts}" fill="url(#fireGrad)" opacity="0.30" />
++                <polyline points="{pts}" fill="none" stroke="#FF6B45" stroke-width="2.5" stroke-linejoin="round" />{flagged_dots}
++                <defs>
++                  <linearGradient id="fireGrad" x1="0" y1="0" x2="0" y2="1">
++                    <stop offset="0%" stop-color="#FF6B45"/>
++                    <stop offset="100%" stop-color="#FF6B45" stop-opacity="0"/>
++                  </linearGradient>
++                </defs>
++              </svg>
++            </div>""", unsafe_allow_html=True)
++
++        # Frame chips now actually populate — the backend used to hardcode
++        # "fire_flagged_frames" to an empty list in its response even though it
++        # had already computed the real list internally, so this section (and
++        # the flagged dots on the chart above) silently never showed anything.
++        # Fixed in MAIN.py alongside this.
++        if r["fire_flagged_frames"]:
++            chips = "".join(f'<span class="chip">#{str(i).zfill(2)}</span>' for i in r["fire_flagged_frames"])
++            st.markdown(f"""
++            <div class="panel">
++              <div class="p-title">Fire flagged frames — {len(r["fire_flagged_frames"])} / {r["total_frames_analyzed"]}</div>
++              <div class="chips">{chips}</div>
++            </div>""", unsafe_allow_html=True)
+ 
+     with st.expander("See the full raw response"):
+         st.json(r)
+diff --git a/config.py b/config.py
+index 6dc79ea..ccba263 100644
+--- a/config.py
++++ b/config.py
+@@ -73,10 +73,41 @@ AI_GENERATED_THRESHOLD = 0.7
+ # evenly spaced across the clip, are sampled instead.
+ AI_SAMPLE_SIZE = 10
+ 
++# How long AI_DETECTOR.py's _get_model() waits before retrying to load the
++# HuggingFace model after a failed attempt, instead of giving up for the
++# rest of the process's lifetime. A transient failure (hub unreachable at
++# startup, brief network hiccup) shouldn't permanently disable the
++# AI-generated check — and now that the check gates whether fire/people
++# detection runs at all (see MAIN.py's run_analysis), a stuck-off AI check
++# means every video silently falls back to the old always-run-everything
++# path with no way to recover without restarting the server.
++AI_DETECTOR_RETRY_COOLDOWN_SECONDS = 600
++
+ # ── Video processing ─────────────────────────────────────────────────────
+ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
+ MAX_UPLOAD_MB = 100
+ 
++# Upper bound on a video's *duration*, independent of MAX_UPLOAD_MB. A long,
++# low-bitrate clip can be small in MB while still decoding into thousands of
++# sampled frames at TARGET_FPS, which would blow up analysis time (and, via
++# the people-detector loop over every fire-flagged frame, GPU cost) far
++# beyond what the file-size limit alone would suggest. Checked against the
++# video's own metadata (frame_count / fps) right after it's opened, before
++# any frames are extracted.
++MAX_VIDEO_DURATION_SECONDS = 300
++
++# Hard backstop on the number of frames extract_frames() will ever write to
++# disk, independent of the duration/FPS math above. MAX_VIDEO_DURATION_SECONDS
++# relies on the video's *reported* metadata (CAP_PROP_FRAME_COUNT) being
++# accurate — some corrupt or unusual containers report 0 or garbage there, in
++# which case that check silently no-ops. This cap doesn't trust metadata at
++# all: it just stops the decode loop once it's written this many frames,
++# regardless of what the video claims about itself. Set generously above the
++# expected worst case (MAX_VIDEO_DURATION_SECONDS * TARGET_FPS = 900) so it
++# never triggers on a legitimate video, only on ones metadata already failed
++# to catch.
++MAX_EXTRACTED_FRAMES = 1200
++
+ # Frames-per-second the video is *downsampled* to before running any model.
+ # Running inference at the source video's native FPS (often 24-60) would be
+ # far more compute than the analysis needs — fire/people/AI-ness don't
+@@ -89,8 +120,39 @@ TARGET_FPS = 3
+ # .mp4 would otherwise sail through). Checking the first few bytes of the
+ # actual file content against known container-format signatures catches
+ # that class of mismatch before the file is ever handed to OpenCV.
+-VIDEO_MAGIC_BYTES = {
+-    b"RIFF": ".avi",           # RIFF....AVI
+-    b"\x1a\x45\xdf\xa3": ".mkv",
+-    # MP4/MOV: 'ftyp' box appears at byte offset 4, not at the start
+-}
++#
++# Each entry is (byte_offset, magic_bytes, valid_extensions) — the file is
++# recognized as a known video container if `magic_bytes` is found at
++# `byte_offset`, and considered a *match for the claimed extension* only if
++# that claimed extension is in `valid_extensions`. The ISO base media
++# 'ftyp' box (offset 4) is shared by both .mp4 and .mov, so both extensions
++# are accepted for that one signature; RIFF/AVI and Matroska/EBML each map
++# to exactly one extension. Read directly by MAIN.py's
++# _sniff_video_content(), which checks the claimed extension against this
++# table rather than just confirming "this is some kind of video" — a .mp4
++# upload that's actually a renamed .avi is a content/extension mismatch
++# worth rejecting, not a false alarm.
++VIDEO_MAGIC_BYTES = [
++    (0, b"RIFF", {".avi"}),           # full check also confirms bytes 8-11 == b"AVI "
++    (0, b"\x1a\x45\xdf\xa3", {".mkv"}),
++    (4, b"ftyp", {".mp4", ".mov"}),
++]
++
++# ── API protection ───────────────────────────────────────────────────────
++# /analyze is the expensive endpoint (up to three model inferences per
++# request) and CORS is wide open (see MAIN.py) — fine for local development
++# or a graded demo, but worth having *some* protection available before
++# this is ever exposed beyond localhost.
++#
++# Both are opt-in and disabled by default (None / 0) so the existing
++# no-auth, unlimited local-demo behavior is unchanged unless explicitly
++# configured — set via environment variables rather than hardcoded here so
++# a real deployment can turn them on without editing source.
++import os
++
++# If set, /analyze requires a matching `X-API-Key` header on every request.
++API_KEY = os.environ.get("FIRE_DETECTOR_API_KEY")  # None = auth disabled
++
++# Max /analyze requests allowed per client IP per rolling 60-second window.
++# 0 or unset = rate limiting disabled.
++RATE_LIMIT_PER_MINUTE = int(os.environ.get("FIRE_DETECTOR_RATE_LIMIT_PER_MINUTE", "0"))
+diff --git a/test_main.py b/test_main.py
+index 85457b8..ce6a131 100644
+--- a/test_main.py
++++ b/test_main.py
+@@ -14,6 +14,7 @@ dedicated tests in test_people_detector.py / test_fire_detector.py.
+ """
+ import io
+ import sys
++from collections import defaultdict, deque
+ from pathlib import Path
+ from unittest.mock import MagicMock
+ 
+@@ -32,10 +33,14 @@ def client():
+ 
+ 
+ # Minimal byte headers that pass _sniff_video_content's magic-byte checks
+-# without needing an actual playable video file — only the first 12 bytes
++# without needing an actual playable video file — only the first 12-16 bytes
+ # are inspected, so the rest of the "video" content is irrelevant filler.
+ VALID_MP4_HEADER = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00" + b"\x00" * 20
+ NOT_A_VIDEO = b"just a plain text file pretending to be a video" * 5
++# A real AVI file's byte signature, uploaded under a .mp4 filename — this is
++# the extension/content *mismatch* case (as opposed to NOT_A_VIDEO, which
++# isn't a recognized video signature at all).
++AVI_HEADER_WRONG_EXTENSION = b"RIFF\x00\x00\x00\x00AVI \x00\x00\x00\x00" + b"\x00" * 20
+ 
+ 
+ def test_rejects_disallowed_extension(client):
+@@ -69,6 +74,69 @@ def test_rejects_content_that_doesnt_match_extension(client, monkeypatch):
+     assert "doesn't match actual file content" in resp.json()["detail"]
+ 
+ 
++def test_rejects_content_extension_mismatch(client, monkeypatch):
++    """
++    Extension says .mp4, but the actual bytes are a valid AVI signature —
++    this should be rejected as a mismatch, not waved through just because
++    the bytes belong to *some* recognized video container. Distinct from
++    test_rejects_content_that_doesnt_match_extension, which covers content
++    that isn't a recognized video signature at all.
++    """
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    resp = client.post(
++        "/analyze",
++        files={"file": ("clip.mp4", io.BytesIO(AVI_HEADER_WRONG_EXTENSION), "video/mp4")},
++    )
++    assert resp.status_code == 400
++    assert "doesn't match actual file content" in resp.json()["detail"]
++
++
++def test_accepts_avi_content_with_avi_extension(client, monkeypatch):
++    """The same AVI byte signature should pass when the claimed extension actually is .avi."""
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    # extract_sample_frames now runs FIRST (for the AI-generated check),
++    # before extract_frames is ever called — both need to be faked out for
++    # a full successful run.
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
++    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
++    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
++    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
++        "people_detected": False, "people_near_fire": False, "people_count": 0,
++        "closest_person_to_fire_px": None, "people_boxes": [],
++    })
++    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: 0.0)
++
++    resp = client.post(
++        "/analyze",
++        files={"file": ("clip.avi", io.BytesIO(AVI_HEADER_WRONG_EXTENSION), "video/x-msvideo")},
++    )
++    assert resp.status_code == 200
++
++
++def test_rejects_video_exceeding_max_duration(client, monkeypatch):
++    """
++    A video whose metadata reports a duration beyond MAX_VIDEO_DURATION_SECONDS
++    should be rejected before frame extraction proceeds, independent of
++    whether it also happens to be under the file-size limit.
++    """
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(config, "MAX_VIDEO_DURATION_SECONDS", 10)
++
++    # 3000 frames / 30 fps = 100s, well past the 10s cap set above.
++    fake_props = {MAIN.cv2.CAP_PROP_FPS: 30.0, MAIN.cv2.CAP_PROP_FRAME_COUNT: 3000.0}
++    fake_cap = MagicMock()
++    fake_cap.isOpened.return_value = True
++    fake_cap.get.side_effect = lambda prop: fake_props.get(prop, 0.0)
++    monkeypatch.setattr(MAIN.cv2, "VideoCapture", lambda path: fake_cap)
++
++    resp = client.post(
++        "/analyze",
++        files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
++    )
++    assert resp.status_code == 400
++    assert "too long" in resp.json()["detail"].lower()
++
++
+ def test_rejects_oversized_upload(client, monkeypatch):
+     """Upload size is enforced while streaming to disk, not after the fact — verified with the limit shrunk so the test doesn't need to push 100MB through."""
+     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+@@ -93,6 +161,10 @@ def test_successful_analysis_assembles_expected_response(client, monkeypatch):
+     monkeypatch.setattr(MAIN, "people_model", MagicMock())
+ 
+     fake_frames = [Path(f"/tmp/frame_{i}.jpg") for i in range(3)]
++    # extract_sample_frames (the small AI-check sample) runs first, then
++    # extract_frames (the full downsample) only if not flagged — both are
++    # faked here since this test expects the full non-flagged pipeline.
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: fake_frames)
+     monkeypatch.setattr(MAIN, "extract_frames", lambda path: fake_frames)
+ 
+     # Frame 1 is "on fire"; the other two are not.
+@@ -128,8 +200,10 @@ def test_successful_analysis_assembles_expected_response(client, monkeypatch):
+     assert resp.status_code == 200
+     body = resp.json()
+     assert body["fire_detected"] is True
++    assert body["fire_check_skipped"] is False
+     assert body["fire_flagged_frames"] == [1]
+     assert body["people_detected"] is True
++    assert body["people_check_skipped"] is False
+     assert body["people_near_fire"] is True
+     assert body["ai_check_available"] is True
+     assert body["ai_generated_probability"] == 0.02
+@@ -137,15 +211,31 @@ def test_successful_analysis_assembles_expected_response(client, monkeypatch):
+     assert body["total_frames_analyzed"] == 3
+ 
+ 
+-def test_ai_generated_verdict_overrides_real_footage_verdict(client, monkeypatch):
+-    """If the AI-generated score clears the threshold, that verdict should win regardless of what fire/people found — since synthetic footage makes those findings untrustworthy."""
++def test_ai_generated_verdict_skips_fire_and_people_detection(client, monkeypatch):
++    """
++    If the AI-generated score clears the threshold, fire/people detection
++    must be skipped entirely — not just overridden in the final verdict
++    text. predict_fire_batch/predict_people_near_fire are wired as spies
++    here specifically to assert they're never called, since running them
++    against footage already known to be synthetic would be wasted compute
++    for findings that would only need to be discarded anyway.
++    """
+     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+-    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+-    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
+-    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
+-        "people_detected": False, "people_near_fire": False, "people_count": 0,
+-        "closest_person_to_fire_px": None, "people_boxes": [],
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
++    # extract_frames must NOT be called in this branch — no monkeypatch for
++    # it here on purpose, so if run_analysis's skip logic regresses and
++    # calls the real extract_frames() against this fake file, the test
++    # fails loudly (real extract_frames returns [] for an unreadable path,
++    # which run_analysis would then treat as an error) rather than passing
++    # for the wrong reason.
++
++    fire_spy = MagicMock(return_value=[{"fire_confidence": 0.99, "fire_boxes": []}])
++    people_spy = MagicMock(return_value={
++        "people_detected": True, "people_near_fire": True, "people_count": 3,
++        "closest_person_to_fire_px": 5.0, "people_boxes": [],
+     })
++    monkeypatch.setattr(MAIN, "predict_fire_batch", fire_spy)
++    monkeypatch.setattr(MAIN, "predict_people_near_fire", people_spy)
+     monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: 0.95)
+ 
+     resp = client.post(
+@@ -153,12 +243,28 @@ def test_ai_generated_verdict_overrides_real_footage_verdict(client, monkeypatch
+         files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
+     )
+     assert resp.status_code == 200
+-    assert resp.json()["verdict"] == "AI-generated footage"
++    body = resp.json()
++    assert body["verdict"] == "AI-generated footage — fire/people detection skipped"
++    assert body["fire_check_skipped"] is True
++    assert body["people_check_skipped"] is True
++    assert body["fire_detected"] is False
++    assert body["people_detected"] is False
++    assert body["fire_flagged_frames"] == []
++    assert body["fire_confidence_timeline"] == []
++    assert body["total_frames_analyzed"] == 1  # just the AI sample — the full extraction never ran
++    fire_spy.assert_not_called()
++    people_spy.assert_not_called()
+ 
+ 
+ def test_ai_check_unavailable_is_reported_not_hidden(client, monkeypatch):
+-    """When every sampled frame's AI check returns None (model unavailable), the response must say so explicitly rather than silently defaulting to a bare 'real footage' claim."""
++    """
++    When every sampled frame's AI check returns None (model unavailable),
++    the response must say so explicitly rather than silently defaulting to
++    a bare 'real footage' claim — and fire/people detection must still run
++    as normal, since an unavailable AI check gives no signal to skip on.
++    """
+     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+     monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+     monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
+     monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
+@@ -175,12 +281,20 @@ def test_ai_check_unavailable_is_reported_not_hidden(client, monkeypatch):
+     body = resp.json()
+     assert body["ai_check_available"] is False
+     assert body["ai_generated_probability"] is None
++    assert body["fire_check_skipped"] is False
++    assert body["people_check_skipped"] is False
+     assert "AI-generated check unavailable" in body["verdict"]
+ 
+ 
+ def test_unexpected_inference_error_returns_clean_500(client, monkeypatch):
+     """An unexpected exception mid-inference (corrupt frame, model quirk, etc) should come back as a clean generic 500, not a raw traceback leaked to the client."""
+     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    # extract_sample_frames feeds the (real, unmocked here) AI-generated
++    # check, which the transformers stub in conftest.py makes return None
++    # for every frame — so ai_check_available comes out False naturally,
++    # and the pipeline proceeds to the full extract_frames + fire branch
++    # below, exactly where this test wants the simulated failure to happen.
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+     monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+ 
+     def _boom(paths, model):
+@@ -205,3 +319,167 @@ def test_health_endpoint_reports_model_status(client, monkeypatch):
+     body = resp.json()
+     assert body["fire_model_loaded"] is True
+     assert body["people_model_loaded"] is False
++
++
++def test_health_endpoint_reports_people_fallback_state(client, monkeypatch):
++    """
++    /health must distinguish "a people model is loaded" from "the *trained*
++    people model is loaded" — people_model_loaded alone can't tell these
++    apart, since a failed custom-weights load silently falls back to
++    yolov8n.pt rather than leaving people_model as None (see
++    PEOPLE_DETECTOR.load_people_model).
++    """
++    import PEOPLE_DETECTOR
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(MAIN, "people_model", MagicMock())
++    monkeypatch.setattr(PEOPLE_DETECTOR, "_using_fallback", True)
++
++    resp = client.get("/health")
++    assert resp.status_code == 200
++    body = resp.json()
++    assert body["people_model_loaded"] is True
++    assert body["people_model_using_fallback"] is True
++
++
++def test_extract_frames_stops_at_max_extracted_frames_backstop(monkeypatch):
++    """
++    extract_frames() must stop decoding once it's written
++    config.MAX_EXTRACTED_FRAMES frames, even if the video claims to have
++    more (or its metadata is wrong/missing and the duration check in
++    run_analysis never caught it). Simulated here with a fake capture that
++    reports ret=True forever — without the backstop, this would hang the
++    test (and, in production, a real request) indefinitely.
++    """
++    monkeypatch.setattr(config, "MAX_EXTRACTED_FRAMES", 5)
++    monkeypatch.setattr(MAIN.cv2, "imwrite", lambda path, frame: True)
++
++    fake_cap = MagicMock()
++    fake_cap.isOpened.return_value = True
++    # FPS = TARGET_FPS so sample_rate collapses to 1 -> every decoded frame
++    # is "saved," making it simple to assert exactly MAX_EXTRACTED_FRAMES
++    # frames were written.
++    fake_cap.get.side_effect = lambda prop: float(config.TARGET_FPS) if prop == MAIN.cv2.CAP_PROP_FPS else 0.0
++    fake_cap.read.return_value = (True, "fake_frame_data")  # ret=True forever
++    monkeypatch.setattr(MAIN.cv2, "VideoCapture", lambda path: fake_cap)
++
++    frames = MAIN.extract_frames(Path("/tmp/fake_infinite_video.mp4"))
++    assert len(frames) == 5
++
++
++def test_extract_sample_frames_falls_back_to_sequential_read_without_frame_count(monkeypatch):
++    """
++    When CAP_PROP_FRAME_COUNT is unavailable (reports 0 — some containers
++    don't populate it), extract_sample_frames() must fall back to reading
++    sequentially from the start instead of seeking to indices computed
++    from an unusable total, and still stop at sample_size frames.
++    """
++    monkeypatch.setattr(MAIN.cv2, "imwrite", lambda path, frame: True)
++
++    fake_cap = MagicMock()
++    fake_cap.isOpened.return_value = True
++    fake_cap.get.return_value = 0.0  # CAP_PROP_FRAME_COUNT unavailable
++    fake_cap.read.return_value = (True, "fake_frame_data")
++    monkeypatch.setattr(MAIN.cv2, "VideoCapture", lambda path: fake_cap)
++
++    frames = MAIN.extract_sample_frames(Path("/tmp/fake_video.mp4"), sample_size=4)
++    assert len(frames) == 4
++    fake_cap.set.assert_not_called()  # sequential fallback shouldn't seek at all
++
++
++def test_rate_limit_blocks_after_threshold(client, monkeypatch):
++    """
++    With RATE_LIMIT_PER_MINUTE configured, a client IP exceeding it within
++    the same 60s window should get 429s on subsequent requests rather than
++    being allowed to keep hammering the expensive /analyze endpoint.
++    """
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
++    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
++    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
++    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
++        "people_detected": False, "people_near_fire": False, "people_count": 0,
++        "closest_person_to_fire_px": None, "people_boxes": [],
++    })
++    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
++    monkeypatch.setattr(config, "RATE_LIMIT_PER_MINUTE", 2)
++    # Fresh, isolated rate-limit state for this test — swapping the whole
++    # object (rather than mutating the shared one) means pytest's
++    # monkeypatch teardown cleanly restores the original afterward.
++    monkeypatch.setattr(MAIN, "_request_log", defaultdict(deque))
++
++    def _post():
++        return client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
++
++    assert _post().status_code == 200
++    assert _post().status_code == 200
++    resp3 = _post()
++    assert resp3.status_code == 429
++    assert "rate limit" in resp3.json()["detail"].lower()
++
++
++def test_rate_limit_disabled_by_default(client, monkeypatch):
++    """RATE_LIMIT_PER_MINUTE defaults to 0 (disabled) — many requests in a row from the same client should never 429 unless it's explicitly configured."""
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
++    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
++    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
++    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
++        "people_detected": False, "people_near_fire": False, "people_count": 0,
++        "closest_person_to_fire_px": None, "people_boxes": [],
++    })
++    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
++    assert config.RATE_LIMIT_PER_MINUTE == 0
++
++    for _ in range(5):
++        resp = client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
++        assert resp.status_code == 200
++
++
++def test_api_key_required_when_configured(client, monkeypatch):
++    """With config.API_KEY set, a request missing (or with the wrong) X-API-Key header should be rejected before any file processing."""
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(config, "API_KEY", "secret-123")
++
++    resp_missing = client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
++    assert resp_missing.status_code == 401
++
++    resp_wrong = client.post(
++        "/analyze",
++        files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
++        headers={"X-API-Key": "wrong-key"},
++    )
++    assert resp_wrong.status_code == 401
++
++
++def test_api_key_accepted_when_correct(client, monkeypatch):
++    """The matching X-API-Key header should let a request through to normal processing."""
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
++    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
++    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
++    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
++        "people_detected": False, "people_near_fire": False, "people_count": 0,
++        "closest_person_to_fire_px": None, "people_boxes": [],
++    })
++    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
++    monkeypatch.setattr(config, "API_KEY", "secret-123")
++
++    resp = client.post(
++        "/analyze",
++        files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
++        headers={"X-API-Key": "secret-123"},
++    )
++    assert resp.status_code == 200
++
++
++def test_api_key_disabled_by_default(client, monkeypatch):
++    """API_KEY defaults to None (disabled) — no header should be required for normal use."""
++    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
++    assert config.API_KEY is None
++    resp = client.post(
++        "/analyze",
++        files={"file": ("clip.txt", io.BytesIO(b"hello"), "text/plain")},
++    )
++    # Reaches the (unrelated) extension check rather than being blocked by auth.
++    assert resp.status_code == 400
++    assert "Unsupported file type" in resp.json()["detail"]
+diff --git a/test_people_detector.py b/test_people_detector.py
+index c797e80..3500ddb 100644
+--- a/test_people_detector.py
++++ b/test_people_detector.py
+@@ -1,15 +1,17 @@
+ """
+ Tests for _box_gap — the pure geometry function behind "is a person near
+-fire" (see PEOPLE_DETECTOR.py). Doesn't touch the YOLO model at all, so
+-these run fast with no GPU or model weights needed — conftest.py's stubs
+-just need to let PEOPLE_DETECTOR.py import cleanly.
++fire" (see PEOPLE_DETECTOR.py) — plus load_people_model's fallback-tracking
++behavior. Doesn't touch a real YOLO model at all, so these run fast with no
++GPU or model weights needed — conftest.py's stubs just need to let
++PEOPLE_DETECTOR.py import cleanly.
+ """
+ import sys
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+-from PEOPLE_DETECTOR import _box_gap
++import PEOPLE_DETECTOR
++from PEOPLE_DETECTOR import _box_gap, is_using_fallback_weights, load_people_model
+ 
+ 
+ def test_overlapping_boxes_have_zero_gap():
+@@ -48,3 +50,29 @@ def test_proximity_threshold_boundary():
+     box_b = [100 + PROXIMITY_THRESHOLD_PX, 0, 300, 100]
+     gap = _box_gap(box_a, box_b)
+     assert gap == PROXIMITY_THRESHOLD_PX
++
++
++def test_successful_custom_load_is_not_flagged_as_fallback(monkeypatch):
++    """When the custom weights load without error, is_using_fallback_weights() must report False."""
++    monkeypatch.setattr(PEOPLE_DETECTOR, "YOLO", lambda path: object())
++    load_people_model("best.pt")
++    assert is_using_fallback_weights() is False
++
++
++def test_failed_custom_load_falls_back_and_is_flagged(monkeypatch):
++    """
++    When the custom weights fail to load, load_people_model() must still
++    return a usable model (the yolov8n.pt fallback) but is_using_fallback_weights()
++    must report True — this is what lets /health tell "a person model is
++    loaded" apart from "the *trained* person model is loaded" instead of
++    reporting a silently-degraded pipeline as fully healthy.
++    """
++    def _flaky_yolo(path):
++        if path == "best.pt":
++            raise RuntimeError("corrupt weights file")
++        return object()  # yolov8n.pt fallback path "succeeds"
++
++    monkeypatch.setattr(PEOPLE_DETECTOR, "YOLO", _flaky_yolo)
++    model = load_people_model("best.pt")
++    assert model is not None
++    assert is_using_fallback_weights() is True

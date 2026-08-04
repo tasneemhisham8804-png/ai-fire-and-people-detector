@@ -73,6 +73,16 @@ AI_GENERATED_THRESHOLD = 0.7
 # evenly spaced across the clip, are sampled instead.
 AI_SAMPLE_SIZE = 10
 
+# How long AI_DETECTOR.py's _get_model() waits before retrying to load the
+# HuggingFace model after a failed attempt, instead of giving up for the
+# rest of the process's lifetime. A transient failure (hub unreachable at
+# startup, brief network hiccup) shouldn't permanently disable the
+# AI-generated check — and now that the check gates whether fire/people
+# detection runs at all (see MAIN.py's run_analysis), a stuck-off AI check
+# means every video silently falls back to the old always-run-everything
+# path with no way to recover without restarting the server.
+AI_DETECTOR_RETRY_COOLDOWN_SECONDS = 600
+
 # ── Video processing ─────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
 MAX_UPLOAD_MB = 100
@@ -85,6 +95,18 @@ MAX_UPLOAD_MB = 100
 # video's own metadata (frame_count / fps) right after it's opened, before
 # any frames are extracted.
 MAX_VIDEO_DURATION_SECONDS = 300
+
+# Hard backstop on the number of frames extract_frames() will ever write to
+# disk, independent of the duration/FPS math above. MAX_VIDEO_DURATION_SECONDS
+# relies on the video's *reported* metadata (CAP_PROP_FRAME_COUNT) being
+# accurate — some corrupt or unusual containers report 0 or garbage there, in
+# which case that check silently no-ops. This cap doesn't trust metadata at
+# all: it just stops the decode loop once it's written this many frames,
+# regardless of what the video claims about itself. Set generously above the
+# expected worst case (MAX_VIDEO_DURATION_SECONDS * TARGET_FPS = 900) so it
+# never triggers on a legitimate video, only on ones metadata already failed
+# to catch.
+MAX_EXTRACTED_FRAMES = 1200
 
 # Frames-per-second the video is *downsampled* to before running any model.
 # Running inference at the source video's native FPS (often 24-60) would be
@@ -115,3 +137,22 @@ VIDEO_MAGIC_BYTES = [
     (0, b"\x1a\x45\xdf\xa3", {".mkv"}),
     (4, b"ftyp", {".mp4", ".mov"}),
 ]
+
+# ── API protection ───────────────────────────────────────────────────────
+# /analyze is the expensive endpoint (up to three model inferences per
+# request) and CORS is wide open (see MAIN.py) — fine for local development
+# or a graded demo, but worth having *some* protection available before
+# this is ever exposed beyond localhost.
+#
+# Both are opt-in and disabled by default (None / 0) so the existing
+# no-auth, unlimited local-demo behavior is unchanged unless explicitly
+# configured — set via environment variables rather than hardcoded here so
+# a real deployment can turn them on without editing source.
+import os
+
+# If set, /analyze requires a matching `X-API-Key` header on every request.
+API_KEY = os.environ.get("FIRE_DETECTOR_API_KEY")  # None = auth disabled
+
+# Max /analyze requests allowed per client IP per rolling 60-second window.
+# 0 or unset = rate limiting disabled.
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("FIRE_DETECTOR_RATE_LIMIT_PER_MINUTE", "0"))

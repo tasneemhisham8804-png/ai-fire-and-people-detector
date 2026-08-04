@@ -10,6 +10,7 @@ frame regardless of fire content would be wasted compute, since the
 place.
 """
 import logging
+import threading
 
 from ultralytics import YOLO
 
@@ -25,6 +26,9 @@ _weights_path = config.PEOPLE_MODEL_PATH
 # see load_people_model) so callers like MAIN.py's /health can tell "a
 # model is loaded" apart from "the *intended* model is loaded".
 _using_fallback = False
+# Serializes calls into the shared YOLO model object — see the docstring on
+# predict_people_near_fire for why.
+_inference_lock = threading.Lock()
 
 # Both the custom-trained weights and the yolov8n.pt fallback report a class
 # literally named "person" (index 0 in standard COCO; the custom model was
@@ -115,11 +119,23 @@ def predict_people_near_fire(frame_path: str, fire_boxes: list[dict]) -> dict:
     enough to flag the frame but the HSV localizer didn't find a matching
     color region — in that case no proximity check is possible and
     people_near_fire is reported as False even if people are present.
+
+    The actual YOLO call is wrapped in a lock: MAIN.py's run_analysis calls
+    this once per fire-flagged frame from a single thread, but multiple
+    concurrent /analyze requests each run in their own threadpool worker
+    thread and would otherwise call into this same shared `_model` object
+    at once. Ultralytics' YOLO wraps a PyTorch model and isn't documented
+    as safe for concurrent inference calls from multiple threads on one
+    instance — serializing here trades a little throughput under
+    concurrent load for not needing a per-request model instance (which
+    would cost real memory, especially on the project's target 4GB-VRAM
+    GPU) or having to independently verify thread-safety.
     """
     if _model is None:
         load_people_model(_weights_path)
 
-    results = _model(frame_path, verbose=False)
+    with _inference_lock:
+        results = _model(frame_path, verbose=False)
     people_boxes = []
 
     for result in results:

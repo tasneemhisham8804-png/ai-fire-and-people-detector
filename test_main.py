@@ -14,6 +14,7 @@ dedicated tests in test_people_detector.py / test_fire_detector.py.
 """
 import io
 import sys
+from collections import defaultdict, deque
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -93,6 +94,10 @@ def test_rejects_content_extension_mismatch(client, monkeypatch):
 def test_accepts_avi_content_with_avi_extension(client, monkeypatch):
     """The same AVI byte signature should pass when the claimed extension actually is .avi."""
     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    # extract_sample_frames now runs FIRST (for the AI-generated check),
+    # before extract_frames is ever called — both need to be faked out for
+    # a full successful run.
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
     monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
     monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
     monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
@@ -156,6 +161,10 @@ def test_successful_analysis_assembles_expected_response(client, monkeypatch):
     monkeypatch.setattr(MAIN, "people_model", MagicMock())
 
     fake_frames = [Path(f"/tmp/frame_{i}.jpg") for i in range(3)]
+    # extract_sample_frames (the small AI-check sample) runs first, then
+    # extract_frames (the full downsample) only if not flagged — both are
+    # faked here since this test expects the full non-flagged pipeline.
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: fake_frames)
     monkeypatch.setattr(MAIN, "extract_frames", lambda path: fake_frames)
 
     # Frame 1 is "on fire"; the other two are not.
@@ -212,7 +221,13 @@ def test_ai_generated_verdict_skips_fire_and_people_detection(client, monkeypatc
     for findings that would only need to be discarded anyway.
     """
     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
-    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+    # extract_frames must NOT be called in this branch — no monkeypatch for
+    # it here on purpose, so if run_analysis's skip logic regresses and
+    # calls the real extract_frames() against this fake file, the test
+    # fails loudly (real extract_frames returns [] for an unreadable path,
+    # which run_analysis would then treat as an error) rather than passing
+    # for the wrong reason.
 
     fire_spy = MagicMock(return_value=[{"fire_confidence": 0.99, "fire_boxes": []}])
     people_spy = MagicMock(return_value={
@@ -236,6 +251,7 @@ def test_ai_generated_verdict_skips_fire_and_people_detection(client, monkeypatc
     assert body["people_detected"] is False
     assert body["fire_flagged_frames"] == []
     assert body["fire_confidence_timeline"] == []
+    assert body["total_frames_analyzed"] == 1  # just the AI sample — the full extraction never ran
     fire_spy.assert_not_called()
     people_spy.assert_not_called()
 
@@ -248,6 +264,7 @@ def test_ai_check_unavailable_is_reported_not_hidden(client, monkeypatch):
     as normal, since an unavailable AI check gives no signal to skip on.
     """
     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
     monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
     monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
     monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
@@ -272,6 +289,12 @@ def test_ai_check_unavailable_is_reported_not_hidden(client, monkeypatch):
 def test_unexpected_inference_error_returns_clean_500(client, monkeypatch):
     """An unexpected exception mid-inference (corrupt frame, model quirk, etc) should come back as a clean generic 500, not a raw traceback leaked to the client."""
     monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    # extract_sample_frames feeds the (real, unmocked here) AI-generated
+    # check, which the transformers stub in conftest.py makes return None
+    # for every frame — so ai_check_available comes out False naturally,
+    # and the pipeline proceeds to the full extract_frames + fire branch
+    # below, exactly where this test wants the simulated failure to happen.
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
     monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
 
     def _boom(paths, model):
@@ -316,3 +339,147 @@ def test_health_endpoint_reports_people_fallback_state(client, monkeypatch):
     body = resp.json()
     assert body["people_model_loaded"] is True
     assert body["people_model_using_fallback"] is True
+
+
+def test_extract_frames_stops_at_max_extracted_frames_backstop(monkeypatch):
+    """
+    extract_frames() must stop decoding once it's written
+    config.MAX_EXTRACTED_FRAMES frames, even if the video claims to have
+    more (or its metadata is wrong/missing and the duration check in
+    run_analysis never caught it). Simulated here with a fake capture that
+    reports ret=True forever — without the backstop, this would hang the
+    test (and, in production, a real request) indefinitely.
+    """
+    monkeypatch.setattr(config, "MAX_EXTRACTED_FRAMES", 5)
+    monkeypatch.setattr(MAIN.cv2, "imwrite", lambda path, frame: True)
+
+    fake_cap = MagicMock()
+    fake_cap.isOpened.return_value = True
+    # FPS = TARGET_FPS so sample_rate collapses to 1 -> every decoded frame
+    # is "saved," making it simple to assert exactly MAX_EXTRACTED_FRAMES
+    # frames were written.
+    fake_cap.get.side_effect = lambda prop: float(config.TARGET_FPS) if prop == MAIN.cv2.CAP_PROP_FPS else 0.0
+    fake_cap.read.return_value = (True, "fake_frame_data")  # ret=True forever
+    monkeypatch.setattr(MAIN.cv2, "VideoCapture", lambda path: fake_cap)
+
+    frames = MAIN.extract_frames(Path("/tmp/fake_infinite_video.mp4"))
+    assert len(frames) == 5
+
+
+def test_extract_sample_frames_falls_back_to_sequential_read_without_frame_count(monkeypatch):
+    """
+    When CAP_PROP_FRAME_COUNT is unavailable (reports 0 — some containers
+    don't populate it), extract_sample_frames() must fall back to reading
+    sequentially from the start instead of seeking to indices computed
+    from an unusable total, and still stop at sample_size frames.
+    """
+    monkeypatch.setattr(MAIN.cv2, "imwrite", lambda path, frame: True)
+
+    fake_cap = MagicMock()
+    fake_cap.isOpened.return_value = True
+    fake_cap.get.return_value = 0.0  # CAP_PROP_FRAME_COUNT unavailable
+    fake_cap.read.return_value = (True, "fake_frame_data")
+    monkeypatch.setattr(MAIN.cv2, "VideoCapture", lambda path: fake_cap)
+
+    frames = MAIN.extract_sample_frames(Path("/tmp/fake_video.mp4"), sample_size=4)
+    assert len(frames) == 4
+    fake_cap.set.assert_not_called()  # sequential fallback shouldn't seek at all
+
+
+def test_rate_limit_blocks_after_threshold(client, monkeypatch):
+    """
+    With RATE_LIMIT_PER_MINUTE configured, a client IP exceeding it within
+    the same 60s window should get 429s on subsequent requests rather than
+    being allowed to keep hammering the expensive /analyze endpoint.
+    """
+    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
+    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
+        "people_detected": False, "people_near_fire": False, "people_count": 0,
+        "closest_person_to_fire_px": None, "people_boxes": [],
+    })
+    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
+    monkeypatch.setattr(config, "RATE_LIMIT_PER_MINUTE", 2)
+    # Fresh, isolated rate-limit state for this test — swapping the whole
+    # object (rather than mutating the shared one) means pytest's
+    # monkeypatch teardown cleanly restores the original afterward.
+    monkeypatch.setattr(MAIN, "_request_log", defaultdict(deque))
+
+    def _post():
+        return client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
+
+    assert _post().status_code == 200
+    assert _post().status_code == 200
+    resp3 = _post()
+    assert resp3.status_code == 429
+    assert "rate limit" in resp3.json()["detail"].lower()
+
+
+def test_rate_limit_disabled_by_default(client, monkeypatch):
+    """RATE_LIMIT_PER_MINUTE defaults to 0 (disabled) — many requests in a row from the same client should never 429 unless it's explicitly configured."""
+    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
+    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
+        "people_detected": False, "people_near_fire": False, "people_count": 0,
+        "closest_person_to_fire_px": None, "people_boxes": [],
+    })
+    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
+    assert config.RATE_LIMIT_PER_MINUTE == 0
+
+    for _ in range(5):
+        resp = client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
+        assert resp.status_code == 200
+
+
+def test_api_key_required_when_configured(client, monkeypatch):
+    """With config.API_KEY set, a request missing (or with the wrong) X-API-Key header should be rejected before any file processing."""
+    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    monkeypatch.setattr(config, "API_KEY", "secret-123")
+
+    resp_missing = client.post("/analyze", files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")})
+    assert resp_missing.status_code == 401
+
+    resp_wrong = client.post(
+        "/analyze",
+        files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
+        headers={"X-API-Key": "wrong-key"},
+    )
+    assert resp_wrong.status_code == 401
+
+
+def test_api_key_accepted_when_correct(client, monkeypatch):
+    """The matching X-API-Key header should let a request through to normal processing."""
+    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    monkeypatch.setattr(MAIN, "extract_sample_frames", lambda path: [Path("/tmp/sample_0.jpg")])
+    monkeypatch.setattr(MAIN, "extract_frames", lambda path: [Path("/tmp/frame_0.jpg")])
+    monkeypatch.setattr(MAIN, "predict_fire_batch", lambda paths, model: [{"fire_confidence": 0.0, "fire_boxes": []}])
+    monkeypatch.setattr(MAIN, "predict_people_near_fire", lambda *a, **k: {
+        "people_detected": False, "people_near_fire": False, "people_count": 0,
+        "closest_person_to_fire_px": None, "people_boxes": [],
+    })
+    monkeypatch.setattr(MAIN, "predict_ai_generated", lambda frame_path: None)
+    monkeypatch.setattr(config, "API_KEY", "secret-123")
+
+    resp = client.post(
+        "/analyze",
+        files={"file": ("clip.mp4", io.BytesIO(VALID_MP4_HEADER), "video/mp4")},
+        headers={"X-API-Key": "secret-123"},
+    )
+    assert resp.status_code == 200
+
+
+def test_api_key_disabled_by_default(client, monkeypatch):
+    """API_KEY defaults to None (disabled) — no header should be required for normal use."""
+    monkeypatch.setattr(MAIN, "fire_model", MagicMock())
+    assert config.API_KEY is None
+    resp = client.post(
+        "/analyze",
+        files={"file": ("clip.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    # Reaches the (unrelated) extension check rather than being blocked by auth.
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]

@@ -25,6 +25,7 @@ score plus any localized fire bounding boxes.
 import os
 import json
 import logging
+import threading
 
 import cv2
 import numpy as np
@@ -33,6 +34,10 @@ import tensorflow as tf
 import config
 
 logger = logging.getLogger("main.fire_detector")
+
+# Serializes calls into the shared Keras model object across concurrent
+# /analyze requests — see predict_fire_batch's docstring for why.
+_inference_lock = threading.Lock()
 
 class ModelLoadError(Exception):
     """Custom exception raised when a model fails to load properly."""
@@ -218,6 +223,17 @@ def predict_fire_batch(frame_paths: list, model) -> list:
     indexed by original position is used instead of appending, so a failed
     frame partway through a batch can't shift everything after it out of
     order.
+
+    The actual model.predict() call is wrapped in a lock: multiple
+    concurrent /analyze requests each run in their own threadpool worker
+    thread (see MAIN.py) and would otherwise call into this same shared
+    Keras model object at once. TensorFlow/Keras models aren't documented
+    as safe for concurrent predict() calls on one instance from multiple
+    threads — serializing here trades a little throughput under concurrent
+    load for not needing a per-request model instance or independently
+    verifying thread-safety. Only the predict() call itself is inside the
+    lock; image loading/decoding above and box localization below stay
+    outside it so they can still happen concurrently across requests.
     """
     if model is None:
         raise ModelLoadError("Inference failed: Fire model layout not initialized.")
@@ -243,7 +259,8 @@ def predict_fire_batch(frame_paths: list, model) -> list:
             continue
 
         try:
-            predictions = model.predict(np.stack(images, axis=0), verbose=0)
+            with _inference_lock:
+                predictions = model.predict(np.stack(images, axis=0), verbose=0)
         except Exception as e:
             logger.warning("Batch prediction failed for %d frame(s): %s", len(images), e)
             for idx in good_indices:
