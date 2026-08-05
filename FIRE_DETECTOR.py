@@ -45,6 +45,11 @@ class ModelLoadError(Exception):
 
 def load_fire_model(model_path: str):
     """
+    🎓 In plain English: this function loads our trained fire-recognizing
+    "brain" (a neural network) from disk into memory, one time, so that
+    every video we analyze later can reuse it instead of reloading it from
+    scratch on every single request.
+
     Loads the fire detector.
 
     Keras 3's default save format is a directory containing config.json
@@ -141,6 +146,13 @@ FIRE_MIN_CORE_RATIO = 0.03       # min fraction of a blob's pixels that must be 
 
 def _localize_fire_regions(frame: np.ndarray, max_boxes: int = None) -> list:
     """
+    🎓 In plain English: once the AI model has already said "yes, there's
+    fire in this frame," this function's job is just to draw a box around
+    WHERE the fire is. It does this the old-fashioned way (no AI) — it
+    looks for pixels that are the right fire-like color (orange/red/yellow)
+    and groups nearby fire-colored pixels together into blobs, then filters
+    out fake ones (like skin) using the "hot core" trick explained below.
+
     Finds fire-colored blobs in a BGR frame and returns their bounding boxes.
 
     Pipeline: HSV color mask -> morphological cleanup -> contour detection
@@ -206,6 +218,14 @@ def _localize_fire_regions(frame: np.ndarray, max_boxes: int = None) -> list:
 
 def predict_fire_batch(frame_paths: list, model) -> list:
     """
+    🎓 In plain English: this is the main "check these video frames for
+    fire" function. It hands the model a stack of frame images at once
+    (a "batch") instead of one at a time, because that's faster. For every
+    frame, it gets back a confidence score from 0 to 1 (how sure the model
+    is that fire is present) — and for the frames the model flags as
+    fiery, it also calls _localize_fire_regions() above to draw boxes
+    around exactly where the fire is in that frame.
+
     Runs the fire classifier over all frames and localizes fire regions on
     any frame that comes back above the confidence threshold.
 

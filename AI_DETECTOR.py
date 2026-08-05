@@ -68,6 +68,14 @@ def _get_model():
 
 def predict_ai_generated(frame_path: str) -> float | None:
     """
+    🎓 In plain English: this is the "does this single video frame look
+    like it was made by an AI image generator, or is it a real camera
+    photo?" check. It hands one frame to a pretrained classifier from
+    HuggingFace and gets back a probability between 0 (definitely real)
+    and 1 (definitely AI-generated). MAIN.py calls this on several frames
+    from the clip and averages the results into one overall score for the
+    whole video.
+
     Returns the probability that a single frame is AI-generated, as a float
     in [0, 1], or None if the model isn't available (failed to load — e.g.
     no network on first run, HF hub unreachable).

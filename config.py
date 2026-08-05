@@ -14,6 +14,13 @@ and combines their outputs into a single verdict:
 All three modules (FIRE_DETECTOR.py, PEOPLE_DETECTOR.py, AI_DETECTOR.py) and
 the orchestrator (MAIN.py) read their tunable knobs from this file instead
 of hardcoding them, so behavior can be retuned without touching model code.
+
+🎓 In plain English: think of this file as the project's single "settings
+panel." Every number below that controls how strict/lenient the app is
+(how confident the model has to be before it says "yes, that's fire," how
+big a video is allowed to be, etc.) lives here in ONE place, instead of
+being scattered as magic numbers across different files. That way, to
+change a behavior you only ever have to edit it in one spot.
 """
 
 # ── Model paths ──────────────────────────────────────────────────────────

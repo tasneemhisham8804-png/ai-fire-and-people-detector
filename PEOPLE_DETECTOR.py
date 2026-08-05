@@ -42,6 +42,13 @@ PERSON_CLASS_NAMES = {"person", "human"}
 
 def load_people_model(weights_path: str = config.PEOPLE_MODEL_PATH):
     """
+    🎓 In plain English: this loads our "find people in this picture" AI
+    model (YOLO) into memory once, like load_fire_model() does for the
+    fire model. The twist here is a safety net — if our own custom-trained
+    weights file is missing or broken, instead of crashing the whole app,
+    it quietly loads a generic, pretrained "find people" model instead so
+    the app keeps working (just slightly less accurately).
+
     Loads the people-detection YOLO model, with a graceful fallback.
 
     If the custom-trained weights (config.PEOPLE_MODEL_PATH, e.g. "best.pt")
@@ -90,6 +97,11 @@ def is_using_fallback_weights() -> bool:
 
 def _box_gap(box_a: list[float], box_b: list[float]) -> float:
     """
+    🎓 In plain English: this is just middle-school geometry — given two
+    rectangles (e.g. a "person" box and a "fire" box) drawn on a video
+    frame, how many pixels apart are their closest edges? If the boxes
+    overlap or touch, the answer is 0 ("they're touching").
+
     Shortest Euclidean distance between the edges of two axis-aligned boxes,
     given as [x1, y1, x2, y2].
 
@@ -111,6 +123,14 @@ def _box_gap(box_a: list[float], box_b: list[float]) -> float:
 
 def predict_people_near_fire(frame_path: str, fire_boxes: list[dict]) -> dict:
     """
+    🎓 In plain English: this is the main "is anyone standing near this
+    fire?" function. Given one frame (that we already know contains fire)
+    plus the fire's bounding box(es), it runs the YOLO people-detector on
+    that frame, then uses _box_gap() above to measure the distance from
+    every detected person to every detected fire region. If the closest
+    person is within PROXIMITY_THRESHOLD_PX pixels of the fire, we flag it
+    as "people near fire."
+
     Runs YOLO on one frame and reports whether any detected person is within
     config.PROXIMITY_THRESHOLD_PX of any of the given fire bounding boxes.
 

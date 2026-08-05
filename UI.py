@@ -320,6 +320,13 @@ st.markdown(_health_script, unsafe_allow_html=True)
 
 def call_api(uploaded_file):
     """
+    🎓 In plain English: this is the "bridge" between what the user sees
+    (this Streamlit page) and the actual AI work happening on the backend
+    server (MAIN.py). It uploads the user's video to the FastAPI /analyze
+    endpoint over HTTP, shows a progress bar while it waits, and then
+    either hands back the JSON results dictionary or shows a friendly error
+    message if something went wrong (wrong file type, server down, etc.).
+
     Sends the video to the backend and returns the parsed JSON result, or
     None if something went wrong (in which case an error is already shown
     to the user here, so the caller doesn't need to).
@@ -373,7 +380,17 @@ def call_api(uploaded_file):
 
 
 def render_dashboard(r: dict, filename: str):
-    """Renders the verdict card, metrics, chart, and frame chips for one result."""
+    """
+    🎓 In plain English: this function takes the raw JSON dictionary that
+    came back from the backend (fire_detected, people_near_fire, ai score,
+    etc.) and turns it into the actual visual results the user sees:
+    the big colored verdict card at the top, the row of stat "metric"
+    boxes, the fire-confidence line chart, and the list of flagged frame
+    numbers. It's purely presentation — all the real detection work already
+    happened on the backend before this function is ever called.
+
+    Renders the verdict card, metrics, chart, and frame chips for one result.
+    """
     ai_available = r.get("ai_check_available", True)
     ai_prob = r.get("ai_generated_probability")
     # Present once the backend flags a clip as AI-generated: fire/people

@@ -146,6 +146,13 @@ def _check_api_key(provided_key: str | None) -> None:
 
 def _sniff_video_content(video_path: Path, claimed_ext: str) -> bool:
     """
+    🎓 In plain English: anyone can rename any file to end in ".mp4" — the
+    filename alone proves nothing. This function actually peeks at the
+    first few bytes of the uploaded file (every real video format stamps
+    a recognizable "signature" right at the start) to double-check that
+    what was uploaded really is the kind of video file it claims to be,
+    instead of trusting the filename blindly.
+
     Confirms a saved upload's actual byte content matches a known video
     container format *and* that the container type is consistent with the
     upload's claimed extension, as a check on top of (not instead of) the
@@ -215,6 +222,14 @@ def _get_video_duration_seconds(video_path: Path) -> float | None:
 
 def extract_sample_frames(video_path: Path, sample_size: int | None = None) -> list[Path]:
     """
+    🎓 In plain English: a video is really just a long list of still images
+    (frames) played quickly. This function "chunks" the video down to a
+    small handful of frames (10, by default) spread out evenly across the
+    whole clip — for example, roughly every 10% mark of the video — and
+    saves each one as its own .jpg image file. These few frames are just
+    enough for the AI-generated-content check to get a fair sample of the
+    whole video without us having to decode the entire thing first.
+
     Decodes just `sample_size` frames (default config.AI_SAMPLE_SIZE),
     evenly spaced across the video's full duration, via direct frame
     seeking (CAP_PROP_POS_FRAMES) rather than reading and discarding every
@@ -277,6 +292,15 @@ def extract_sample_frames(video_path: Path, sample_size: int | None = None) -> l
 
 def extract_frames(video_path: Path) -> list[Path]:
     """
+    🎓 In plain English: this is the main "chunk the video into frames"
+    function that the fire and people detectors actually run on. Rather
+    than saving EVERY frame (a 60-frames-per-second video would generate a
+    huge, mostly-redundant pile of nearly-identical images), it saves
+    frames at a fixed, lighter rate — config.TARGET_FPS (3 per second by
+    default) — regardless of how fast the original video plays. So a
+    10-second clip becomes about 30 saved .jpg images to run our models on,
+    whether the source video was recorded at 24fps or 60fps.
+
     Decodes the video with OpenCV and writes out a downsampled subset of
     frames as JPEGs (in the same temp directory as the source video), one
     per config.TARGET_FPS "tick" of the original video's timeline.
@@ -332,6 +356,25 @@ def extract_frames(video_path: Path) -> list[Path]:
 
 def run_analysis(video_path: Path) -> dict:
     """
+    🎓 In plain English — this function is the "brain" of the whole
+    project. Given one uploaded video file, here's the story of what
+    happens to it, step by step:
+        1. Make sure the video isn't absurdly long.
+        2. Chunk out a small handful of sample frames (see
+           extract_sample_frames() above) and ask the AI-generated-content
+           detector "does this look real or AI-generated?"
+        3. If it looks AI-generated, STOP — there's no point checking a
+           fake video for real fire or real people, so we skip straight to
+           building the verdict.
+        4. Otherwise, chunk the FULL video into frames (see extract_frames()
+           above) and run the fire detector on every one of them.
+        5. For any frame that has fire in it, also run the people detector
+           on that same frame, and measure how close any detected person
+           is to the fire.
+        6. Put everything together into one plain-English verdict sentence
+           (e.g. "Real footage — fire detected with people in proximity")
+           plus all the raw numbers, and return it.
+
     Runs the full detection pipeline on one video and returns the combined
     result dict that becomes the /analyze response body.
 
@@ -526,6 +569,14 @@ async def analyze_video(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
     """
+    🎓 In plain English: this is the actual web address (endpoint) the
+    Streamlit frontend calls when the user clicks "Analyze this video." It
+    doesn't do any of the actual AI work itself — its job is to be the
+    careful "bouncer at the door": check the upload is allowed in, save it
+    safely to a temporary file, confirm it's really a video, and only then
+    hand it off to run_analysis() (the function that does the real work)
+    and send back the JSON result.
+
     Accepts a multipart video upload (field name "file"), validates it, runs
     the full detection pipeline, and returns the combined JSON result
     described in run_analysis()'s docstring (shape enforced by the
